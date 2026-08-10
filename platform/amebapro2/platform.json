@@ -1,0 +1,25 @@
+{
+  "name": "amebapro2-local",
+  "title": "Realtek AmebaPro2",
+  "description": "Local PlatformIO integration for RTL8735B/BW21-CBV using the official Realtek Arduino core.",
+  "homepage": "https://github.com/Ameba-AIoT/ameba-arduino-pro2",
+  "license": "MIT",
+  "keywords": [
+    "dev-platform",
+    "rtl8735b",
+    "amebapro2",
+    "bw21",
+    "camera"
+  ],
+  "engines": {
+    "platformio": "^6"
+  },
+  "version": "0.1.0",
+  "frameworks": {
+    "arduino": {
+      "script": "builder/frameworks/arduino.py"
+    }
+  },
+  "packages": {}
+}
+

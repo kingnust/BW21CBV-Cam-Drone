@@ -1,0 +1,25 @@
+{
+  "build": {
+    "core": "ambpro2",
+    "f_cpu": "500000000L",
+    "mcu": "RTL8735B",
+    "variant": "ameba_amb82-mini"
+  },
+  "connectivity": [
+    "wifi",
+    "bluetooth"
+  ],
+  "frameworks": [
+    "arduino"
+  ],
+  "name": "Ai-Thinker BW21-CBV-Kit (GC2053)",
+  "upload": {
+    "maximum_size": 16777216,
+    "protocol": "usb_serial",
+    "require_upload_port": false,
+    "speed": 2000000
+  },
+  "url": "https://docs.aithinker.com/en/bw21/index.html",
+  "vendor": "Ai-Thinker"
+}
+

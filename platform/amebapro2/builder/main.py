@@ -5,6 +5,7 @@ import platform
 import shutil
 import subprocess
 import tarfile
+import time
 import urllib.request
 import zipfile
 from datetime import datetime, timezone
@@ -189,21 +190,26 @@ def build_firmware(target, source, env):
         ensure_toolchain()
         stage_sources()
         ARDUINO_BUILD_DIR.mkdir(parents=True, exist_ok=True)
-        run_cli(
-            [
-                "compile",
-                "--fqbn",
-                FQBN,
-                "--build-path",
-                str(ARDUINO_BUILD_DIR),
-                "--warnings",
-                "all",
-                str(SKETCH_DIR),
-            ]
-        )
-        if ARDUINO_OUTPUT_DIR.exists():
-            shutil.rmtree(ARDUINO_OUTPUT_DIR)
-        ARDUINO_OUTPUT_DIR.mkdir(parents=True)
+        compile_arguments = [
+            "compile",
+            "--fqbn",
+            FQBN,
+            "--build-path",
+            str(ARDUINO_BUILD_DIR),
+            "--warnings",
+            "all",
+            str(SKETCH_DIR),
+        ]
+        for attempt in range(1, 4):
+            try:
+                run_cli(compile_arguments)
+                break
+            except RuntimeError:
+                if attempt == 3:
+                    raise
+                print(f"Realtek compiler failed; retrying ({attempt}/3)...")
+                time.sleep(1)
+        ARDUINO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         for artifact_name in ("flash_ntz.bin", "application.ntz", "application.ntz.map"):
             artifact = ARDUINO_BUILD_DIR / artifact_name
             if not artifact.is_file():
@@ -240,6 +246,10 @@ def setup_toolchain(target, source, env):
 
 
 def detect_upload_port():
+    command_line_port = env.subst("$UPLOAD_PORT").strip()
+    if command_line_port and "$" not in command_line_port:
+        return command_line_port
+
     configured = env.GetProjectOption("upload_port", "").strip()
     if configured:
         return configured
@@ -264,18 +274,22 @@ def upload_firmware(target, source, env):
     try:
         ensure_toolchain()
         port = detect_upload_port()
-        run_cli(
+        upload_output = run_cli(
             [
                 "upload",
                 "--port",
                 port,
                 "--fqbn",
                 FQBN,
-                "--input-dir",
-                str(ARDUINO_BUILD_DIR),
+                "--input-file",
+                str(ARDUINO_BUILD_DIR / "flash_ntz.bin"),
                 str(SKETCH_DIR),
-            ]
+            ],
+            capture=True,
         )
+        failure_markers = ("upload fail", "uart boot fail", "flashloader loading fail")
+        if any(marker in upload_output.lower() for marker in failure_markers):
+            raise RuntimeError("Realtek uploader reported a flash failure")
         return 0
     except Exception as error:
         print(f"Error: {error}")

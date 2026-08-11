@@ -2,7 +2,7 @@
 
 #include "BuildConfig.h"
 
-#define BW21CAM_VERSION "0.1.0-test"
+#define BW21CAM_VERSION "0.1.1-test"
 
 // Direct access-point mode matches the old ESP32-CAM test workflow.
 #define BW21CAM_USE_ACCESS_POINT 1

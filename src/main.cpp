@@ -30,14 +30,15 @@ constexpr int DEFAULT_PROFILE = 1;
 
 VideoSetting streamConfig(BW21CAM_STREAM_WIDTH, BW21CAM_STREAM_HEIGHT,
                           PROFILES[DEFAULT_PROFILE].fps, VIDEO_JPEG, 1);
-WiFiServer controlServer(BW21CAM_CONTROL_PORT, TCP_MODE, NON_BLOCKING_MODE);
-WiFiServer streamServer(BW21CAM_STREAM_PORT, TCP_MODE, NON_BLOCKING_MODE);
+WiFiServer controlServer(BW21CAM_CONTROL_PORT);
+WiFiServer streamServer(BW21CAM_STREAM_PORT);
 
 volatile int activeProfile = DEFAULT_PROFILE;
 volatile int pendingProfile = -1;
 volatile uint32_t frameCount = 0;
 volatile uint32_t streamErrorCount = 0;
 volatile uint32_t streamClientCount = 0;
+volatile uint32_t streamRejectCount = 0;
 
 #if BW21CAM_USE_ACCESS_POINT
 char apSsid[] = BW21CAM_AP_SSID;
@@ -79,14 +80,18 @@ const char INDEX_HTML[] = R"HTML(<!doctype html>
   <script>
     const state=document.getElementById('state'),buttons=[...document.querySelectorAll('button[data-profile]')];
     const stream=document.getElementById('stream');
-    function connectStream(){stream.src='http://'+location.hostname+':81/stream?t='+Date.now()}
-    stream.onload=()=>state.textContent='Live';
-    stream.onerror=()=>{state.textContent='Reconnecting';setTimeout(connectStream,1000)};
-    async function status(){try{const r=await fetch('/api/status',{cache:'no-store'}),s=await r.json();
+    let retryTimer=0,lastFrames=-1,lastProgressAt=Date.now();
+    function markLive(text){if(retryTimer){clearTimeout(retryTimer);retryTimer=0}state.textContent=text}
+    function connectStream(){retryTimer=0;lastProgressAt=Date.now();state.textContent='Connecting';stream.src='http://'+location.hostname+':81/stream?t='+Date.now()}
+    function reconnect(delay=1000){if(retryTimer)return;state.textContent='Reconnecting';retryTimer=setTimeout(connectStream,delay)}
+    stream.onload=()=>{lastProgressAt=Date.now();markLive('Live')};
+    stream.onerror=()=>reconnect();
+    async function status(){try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw new Error('status');const s=await r.json();
       document.getElementById('fps').textContent=s.fps;document.getElementById('quality').textContent=s.quality;
-      buttons.forEach((b,i)=>b.classList.toggle('active',i===s.profile));state.textContent='Live | '+s.frames+' frames';
-    }catch(e){state.textContent='Control link lost'}}
-    buttons.forEach(b=>b.onclick=async()=>{buttons.forEach(x=>x.disabled=true);try{await fetch('/api/profile?id='+b.dataset.profile,{cache:'no-store'});await status()}finally{buttons.forEach(x=>x.disabled=false)}});
+      buttons.forEach((b,i)=>b.classList.toggle('active',i===s.profile));const now=Date.now();
+      if(lastFrames<0){lastFrames=s.frames;lastProgressAt=now}else if(s.frames!==lastFrames){lastFrames=s.frames;lastProgressAt=now;markLive('Live | '+s.frames+' frames')}else if(now-lastProgressAt>5000){reconnect(250)}
+    }catch(e){if(!retryTimer)state.textContent='Control link lost'}}
+    buttons.forEach(b=>b.onclick=async()=>{buttons.forEach(x=>x.disabled=true);try{const r=await fetch('/api/profile?id='+b.dataset.profile,{cache:'no-store'});if(!r.ok)throw new Error('profile');await status()}finally{buttons.forEach(x=>x.disabled=false)}});
     connectStream();status();setInterval(status,2000);
   </script>
 </body>
@@ -98,12 +103,13 @@ bool writeAll(WiFiClient& client, const uint8_t* data, size_t length)
     uint32_t lastProgressMs = millis();
     while (sent < length && client.connected()) {
         size_t block = length - sent;
-        if (block > 16384) {
-            block = 16384;
+        if (block > 1460) {
+            block = 1460;
         }
-        const size_t written = client.write(data + sent, block);
-        if (written > 0) {
-            sent += written;
+        const bool written = client.write(data + sent, block) > 0;
+        if (written) {
+            // AmebaPro2 reports write success as 1, not the transmitted byte count.
+            sent += block;
             lastProgressMs = millis();
         } else {
             if (millis() - lastProgressMs >= CLIENT_WRITE_TIMEOUT_MS) {
@@ -141,6 +147,19 @@ bool readRequestLine(WiFiClient& client, char* line, size_t capacity)
     return false;
 }
 
+bool requestTargets(const char* request, const char* path)
+{
+    if (!request || strncmp(request, "GET ", 4) != 0) {
+        return false;
+    }
+
+    const char* target = request + 4;
+    const size_t pathLength = strlen(path);
+    return strncmp(target, path, pathLength) == 0 &&
+           (target[pathLength] == ' ' || target[pathLength] == '?' ||
+            target[pathLength] == 0);
+}
+
 void drainHeaders(WiFiClient& client)
 {
     char line[160];
@@ -167,11 +186,12 @@ void sendStatus(WiFiClient& client)
 {
     const int profileId = activeProfile;
     const StreamProfile& profile = PROFILES[profileId];
-    char json[420];
+    char json[460];
     snprintf(json, sizeof(json),
              "{\"version\":\"%s\",\"profile\":%d,\"name\":\"%s\","
              "\"fps\":%u,\"quality\":%u,\"width\":%u,\"height\":%u,"
              "\"frames\":%lu,\"stream_clients\":%lu,\"stream_errors\":%lu,"
+             "\"stream_rejects\":%lu,"
              "\"fc_enabled\":%s,\"fc_connected\":%s,\"fc_requests\":%lu,"
              "\"fc_responses\":%lu,\"fc_crc_errors\":%lu}",
              BW21CAM_VERSION, profileId, profile.name, profile.fps, profile.jpegQuality,
@@ -179,6 +199,7 @@ void sendStatus(WiFiClient& client)
              static_cast<unsigned long>(frameCount),
              static_cast<unsigned long>(streamClientCount),
              static_cast<unsigned long>(streamErrorCount),
+             static_cast<unsigned long>(streamRejectCount),
              BW21CAM_ENABLE_FC_LINK ? "true" : "false",
              FcLink::connected() ? "true" : "false",
              static_cast<unsigned long>(FcLink::requestCount()),
@@ -196,17 +217,21 @@ void handleControlClient(WiFiClient& client)
     }
     drainHeaders(client);
 
-    if (strncmp(request, "GET /api/status ", 16) == 0) {
+    if (requestTargets(request, "/api/status")) {
         sendStatus(client);
-    } else if (strncmp(request, "GET /api/profile?id=", 20) == 0) {
-        const int requested = atoi(request + 20);
-        if (requested >= 0 && requested < PROFILE_COUNT) {
+    } else if (requestTargets(request, "/api/profile")) {
+        const char* id = strstr(request, "?id=");
+        char* end = nullptr;
+        const long requested = id ? strtol(id + 4, &end, 10) : -1;
+        const bool valid = id && end != id + 4 && (*end == ' ' || *end == '&') &&
+                           requested >= 0 && requested < PROFILE_COUNT;
+        if (valid) {
             pendingProfile = requested;
             sendResponse(client, 202, "Accepted", "application/json", "{\"accepted\":true}");
         } else {
             sendResponse(client, 400, "Bad Request", "application/json", "{\"accepted\":false}");
         }
-    } else if (strncmp(request, "GET / ", 6) == 0) {
+    } else if (requestTargets(request, "/")) {
         sendResponse(client, 200, "OK", "text/html; charset=utf-8", INDEX_HTML);
     } else {
         sendResponse(client, 404, "Not Found", "text/plain", "Not found");
@@ -242,7 +267,7 @@ void applyPendingProfile()
     Serial.println(profile.jpegQuality);
 }
 
-void sendStreamHeader(WiFiClient& client)
+bool sendStreamHeader(WiFiClient& client)
 {
     char header[240];
     snprintf(header, sizeof(header),
@@ -251,12 +276,21 @@ void sendStreamHeader(WiFiClient& client)
              "Content-Type: multipart/x-mixed-replace; boundary=%s\r\n"
              "Connection: close\r\n\r\n--%s\r\n",
              STREAM_BOUNDARY, STREAM_BOUNDARY);
-    writeText(client, header);
+    return writeText(client, header);
+}
+
+void controlTask(void*)
+{
+    for (;;) {
+        WiFiClient client = controlServer.available();
+        if (client) {
+            handleControlClient(client);
+        }
+    }
 }
 
 void streamTask(void*)
 {
-    streamServer.begin();
     for (;;) {
         applyPendingProfile();
         WiFiClient client = streamServer.available();
@@ -267,11 +301,16 @@ void streamTask(void*)
 
         char request[160];
         if (!readRequestLine(client, request, sizeof(request))) {
+            streamRejectCount++;
+            Serial.println("Stream request timed out");
             client.stop();
             continue;
         }
         drainHeaders(client);
-        if (strncmp(request, "GET /stream ", 12) != 0) {
+        if (!requestTargets(request, "/stream")) {
+            streamRejectCount++;
+            Serial.print("Rejected stream request: ");
+            Serial.println(request);
             sendResponse(client, 404, "Not Found", "text/plain", "Use /stream");
             client.stop();
             continue;
@@ -279,7 +318,11 @@ void streamTask(void*)
 
         streamClientCount++;
         Serial.println("Camera viewer connected");
-        sendStreamHeader(client);
+        if (!sendStreamHeader(client)) {
+            streamErrorCount++;
+            client.stop();
+            continue;
+        }
 
         while (client.connected()) {
             applyPendingProfile();
@@ -381,6 +424,10 @@ void printPeriodicStatus()
     Serial.print(frameCount);
     Serial.print(" stream_errors=");
     Serial.print(streamErrorCount);
+    Serial.print(" stream_clients=");
+    Serial.print(streamClientCount);
+    Serial.print(" stream_rejects=");
+    Serial.print(streamRejectCount);
 #if BW21CAM_ENABLE_FC_LINK
     Serial.print(" fc=");
     Serial.print(FcLink::connected() ? "connected" : "waiting");
@@ -407,18 +454,23 @@ void setup()
     FcLink::begin();
 
     controlServer.begin();
-    xTaskCreate(streamTask, "CameraStream", 10 * 1024, nullptr, 2, nullptr);
+    streamServer.begin();
+    const BaseType_t controlStarted =
+        xTaskCreate(controlTask, "CameraControl", 4 * 1024, nullptr, 1, nullptr);
+    const BaseType_t streamStarted =
+        xTaskCreate(streamTask, "CameraStream", 10 * 1024, nullptr, 2, nullptr);
+    if (controlStarted != pdPASS || streamStarted != pdPASS) {
+        Serial.print("Server task start failed control=");
+        Serial.print(controlStarted);
+        Serial.print(" stream=");
+        Serial.println(streamStarted);
+    }
     Serial.println("Camera test ready");
 }
 
 void loop()
 {
     FcLink::update();
-
-    WiFiClient client = controlServer.available();
-    if (client) {
-        handleControlClient(client);
-    }
 
     printPeriodicStatus();
     delay(1);

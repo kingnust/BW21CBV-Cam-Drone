@@ -5,4 +5,8 @@ build/
 *.bin
 *.elf
 *.map
-
+laptop_vision/.venv/
+laptop_vision/__pycache__/
+laptop_vision/*.jsonl
+laptop_vision/*.pt
+diagnostics/

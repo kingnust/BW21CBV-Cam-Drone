@@ -54,6 +54,43 @@ uses 8 because level 9 can create much larger images for little visible gain.
 After uploading, open the serial monitor at 115200 baud, connect a phone or
 laptop to the printed access point, and open the printed web address.
 
+## Vision choices
+
+Two independent vision paths are included so they can be evaluated before one
+is selected for the drone.
+
+### On-device BW21 vision
+
+```powershell
+platformio run -e bw21-cam-vision
+platformio run -e bw21-cam-vision -t upload
+```
+
+The vision build continuously analyzes the exact captured JPEG frames, even
+when no browser is connected. A dedicated 640 x 360 camera channel scans every
+analysis frame for QR codes and calculates per-object color without blocking
+the live stream, while the Realtek NN engine runs YOLOv4-tiny on a separate
+576 x 320, 10 FPS camera channel. Results and stale
+state are available in the web page, `/api/status`, and `/api/vision`.
+
+Use `bw21-cam-vision-wk2132` to add the FC link. A newly decoded QR payload is
+then sent through the existing acknowledged MSP2 QR transport. Ordinary camera
+and WK2132 builds do not initialize QR or neural-network code.
+
+### Laptop vision
+
+The `laptop_vision/` program reads the MJPEG stream directly. Every decoded
+frame receives a full-field QR pass, with curved, contrast, and high-detail
+fallbacks distributed across frames to prevent scan latency from accumulating.
+Ultralytics YOLO runs in a separate latest-frame worker: slow inference replaces
+old pending frames instead of replaying stale video. The laptop path also adds
+per-object color, event logging, and optional calibrated OpenCV fisheye
+correction. See `laptop_vision/README.md` for setup and calibration commands.
+
+The default laptop model recognizes common objects. Project-specific packages,
+dangerous items, landing markers, or other custom classes require a trained
+model passed with `--model`.
+
 ## WK2132 flight-controller link
 
 The WK2132 is an I2C-to-dual-UART bridge on the flight controller. The BW21 does
@@ -89,8 +126,8 @@ a dedicated MSP parser while the WK2132 itself remains on the shared FC I2C
 bus. Use the FC CLI commands `wk2132` and `camera_uart` to inspect both sides of
 the link.
 
-This first camera test build does not decode QR codes on the BW21. The QR API is
-the prepared transport for that later firmware stage.
+The camera-test and WK2132-only builds do not decode QR codes. Select one of the
+vision environments when onboard QR/object processing is required.
 
 Do not enable the FC link until the WK2132 build is running on the flight
 controller and the crossed UART wiring has been checked.

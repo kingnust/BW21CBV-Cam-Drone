@@ -2,7 +2,7 @@
 
 #include "BuildConfig.h"
 
-#define BW21CAM_VERSION "0.1.1-test"
+#define BW21CAM_VERSION "0.2.1-vision"
 
 // Direct access-point mode matches the old ESP32-CAM test workflow.
 #define BW21CAM_USE_ACCESS_POINT 1
@@ -19,6 +19,13 @@
 
 #define BW21CAM_STREAM_WIDTH 1280
 #define BW21CAM_STREAM_HEIGHT 720
+
+// The ISP corrects the wide-angle lens before QR and object processing.
+#define BW21CAM_ENABLE_LENS_DISTORTION_CORRECTION 1
+
+#define BW21CAM_QR_STALE_MS 5000
+#define BW21CAM_OBJECT_STALE_MS 1500
+#define BW21CAM_VISION_MAX_OBJECTS 8
 
 // PlatformIO enables this only in the bw21-cam-wk2132 environment.
 #define BW21CAM_FC_BAUD 115200

@@ -1,9 +1,16 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include "VideoStream.h"
+#include <lwip/sockets.h>
+
+#undef read
+#undef write
+
+#include <stdarg.h>
 
 #include "AppConfig.h"
 #include "FcLink.h"
+#include "OnDeviceVision.h"
 
 namespace {
 
@@ -12,6 +19,9 @@ constexpr char STREAM_BOUNDARY[] = "bw21frame";
 constexpr uint32_t REQUEST_TIMEOUT_MS = 750;
 constexpr uint32_t CLIENT_WRITE_TIMEOUT_MS = 2500;
 constexpr uint32_t SERIAL_STATUS_INTERVAL_MS = 5000;
+constexpr uint32_t FRAME_STALL_THRESHOLD_MS = 250;
+constexpr size_t TCP_WRITE_BLOCK_BYTES = 16 * 1024;
+constexpr int SOCKET_SCAN_LIMIT = 16;
 
 struct StreamProfile {
     const char* name;
@@ -26,19 +36,69 @@ const StreamProfile PROFILES[] = {
 };
 
 constexpr int PROFILE_COUNT = sizeof(PROFILES) / sizeof(PROFILES[0]);
-constexpr int DEFAULT_PROFILE = 1;
+constexpr int DEFAULT_PROFILE = 0;
 
 VideoSetting streamConfig(BW21CAM_STREAM_WIDTH, BW21CAM_STREAM_HEIGHT,
                           PROFILES[DEFAULT_PROFILE].fps, VIDEO_JPEG, 1);
+CameraSetting cameraSettings;
 WiFiServer controlServer(BW21CAM_CONTROL_PORT);
 WiFiServer streamServer(BW21CAM_STREAM_PORT);
 
 volatile int activeProfile = DEFAULT_PROFILE;
 volatile int pendingProfile = -1;
 volatile uint32_t frameCount = 0;
+volatile uint32_t cameraFrameCount = 0;
+volatile uint32_t captureErrorCount = 0;
 volatile uint32_t streamErrorCount = 0;
 volatile uint32_t streamClientCount = 0;
 volatile uint32_t streamRejectCount = 0;
+volatile uint32_t streamStallCount = 0;
+volatile uint32_t maxCaptureMs = 0;
+volatile uint32_t maxSendMs = 0;
+volatile uint32_t maxFrameGapMs = 0;
+volatile uint32_t lastCameraFrameMs = 0;
+
+bool configureAcceptedSocket(uint16_t localPort)
+{
+    bool found = false;
+    bool configured = true;
+    for (int socket = 0; socket < SOCKET_SCAN_LIMIT; socket++) {
+        sockaddr_in localAddress = {};
+        sockaddr_in peerAddress = {};
+        socklen_t localLength = sizeof(localAddress);
+        socklen_t peerLength = sizeof(peerAddress);
+        if (lwip_getsockname(socket, reinterpret_cast<sockaddr*>(&localAddress),
+                             &localLength) != 0 ||
+            localAddress.sin_family != AF_INET ||
+            ntohs(localAddress.sin_port) != localPort ||
+            lwip_getpeername(socket, reinterpret_cast<sockaddr*>(&peerAddress),
+                             &peerLength) != 0) {
+            continue;
+        }
+
+        found = true;
+        const int timeoutMs = CLIENT_WRITE_TIMEOUT_MS;
+        const int enabled = 1;
+        const int keepIdleSeconds = 3;
+        const int keepIntervalSeconds = 1;
+        const int keepCount = 2;
+        const bool socketConfigured =
+            lwip_setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeoutMs,
+                            sizeof(timeoutMs)) == 0 &&
+            lwip_setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, &enabled,
+                            sizeof(enabled)) == 0 &&
+            lwip_setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &enabled,
+                            sizeof(enabled)) == 0 &&
+            lwip_setsockopt(socket, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdleSeconds,
+                            sizeof(keepIdleSeconds)) == 0 &&
+            lwip_setsockopt(socket, IPPROTO_TCP, TCP_KEEPINTVL, &keepIntervalSeconds,
+                            sizeof(keepIntervalSeconds)) == 0 &&
+            lwip_setsockopt(socket, IPPROTO_TCP, TCP_KEEPCNT, &keepCount,
+                            sizeof(keepCount)) == 0;
+        configured = configured && socketConfigured;
+    }
+    return found && configured;
+}
 
 #if BW21CAM_USE_ACCESS_POINT
 char apSsid[] = BW21CAM_AP_SSID;
@@ -56,43 +116,53 @@ const char INDEX_HTML[] = R"HTML(<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>BW21 Camera</title>
   <style>
-    *{box-sizing:border-box}body{margin:0;background:#111418;color:#f5f7fa;font:15px Arial,sans-serif}
-    main{width:min(920px,100%);margin:auto;padding:16px}header{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-bottom:12px}
-    h1{margin:0;font-size:24px;letter-spacing:0}.state{color:#aeb7c2;font-size:13px;text-align:right}
-    .viewer{width:100%;aspect-ratio:16/9;background:#050607;border:1px solid #30363d;overflow:hidden}
-    .viewer img{display:block;width:100%;height:100%;object-fit:contain}.bar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 0;flex-wrap:wrap}
-    .modes{display:inline-grid;grid-template-columns:repeat(3,1fr);border:1px solid #3c444e}.modes button{min-width:96px;padding:10px 13px;border:0;border-right:1px solid #3c444e;background:#1b2026;color:#e8edf2;font-weight:700;cursor:pointer}
-    .modes button:last-child{border-right:0}.modes button.active{background:#54c27a;color:#07120b}.modes button:disabled{opacity:.55;cursor:wait}
-    .metrics{display:flex;gap:16px;color:#c5ced8;font-size:13px}.metrics b{color:#f3c969;font-weight:700}@media(max-width:520px){header{align-items:start}.modes{width:100%}.modes button{min-width:0;padding:10px 6px}.metrics{width:100%;justify-content:space-between}}
+    *{box-sizing:border-box}html,body{max-width:100%;overflow-x:hidden}body{margin:0;background:#101317;color:#f4f6f8;font:15px Arial,sans-serif}
+    main{width:min(960px,100%);margin:auto;padding:14px}header,.toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px}
+    header{margin-bottom:10px}h1{margin:0;font-size:22px;letter-spacing:0}.state{color:#aab4bf;font-size:13px}
+    .viewer{position:relative;width:100%;aspect-ratio:16/9;background:#050607;border:1px solid #333a43;overflow:hidden}
+    .viewer img,.viewer canvas{position:absolute;inset:0;width:100%;height:100%}.viewer img{display:block;object-fit:contain}.viewer img.mirrored{transform:scaleX(-1)}.viewer canvas{pointer-events:none}
+    .toolbar{padding:10px 0;flex-wrap:wrap}.controls{display:flex;gap:8px;flex-wrap:wrap}.modes{display:inline-grid;grid-template-columns:repeat(3,1fr);border:1px solid #3d4650}
+    button{height:38px;padding:0 12px;border:1px solid #3d4650;background:#1c2229;color:#eef2f5;font-weight:700;cursor:pointer}button.active{background:#50bd78;color:#07120b;border-color:#50bd78}button:disabled{opacity:.55;cursor:wait}
+    .modes,.modes button{min-width:0}.modes button{border-width:0 1px 0 0}.modes button:last-child{border-right:0}.metrics{display:flex;gap:14px;color:#b9c3cd;font-size:13px}.metrics b{color:#f1c75b}
+    .results{border-top:1px solid #303741;padding-top:10px}.qr{font-size:14px;color:#b9c3cd;overflow-wrap:anywhere}.qr b{color:#f4f6f8}.objects{display:flex;gap:8px;flex-wrap:wrap;margin-top:9px;min-height:30px}
+    .object{padding:6px 8px;border-left:3px solid #50bd78;background:#1a2026;color:#e6ebef;font-size:13px}.empty{color:#8f9aa5;font-size:13px}
+    @media(max-width:560px){main{padding:10px}header{align-items:flex-start;flex-wrap:wrap}.toolbar{align-items:flex-start}.controls,.modes{width:100%}.modes button{padding:0 4px}.metrics{width:100%;justify-content:space-between;gap:6px}}
   </style>
 </head>
 <body>
   <main>
     <header><h1>BW21 Camera</h1><div id="state" class="state">Connecting</div></header>
-    <div class="viewer"><img id="stream" alt="Live camera"></div>
-    <div class="bar">
-      <div class="modes" aria-label="Video profile">
-        <button data-profile="0">Smooth</button><button data-profile="1">Balanced</button><button data-profile="2">Detail</button>
+    <div id="viewer" class="viewer"><img id="stream" alt="Live camera"><canvas id="overlay"></canvas></div>
+    <div class="toolbar">
+      <div class="controls">
+        <div class="modes" aria-label="Video profile">
+          <button data-profile="0">Smooth</button><button data-profile="1">Balanced</button><button data-profile="2">Detail</button>
+        </div>
+        <button id="mirror" type="button" aria-pressed="false" title="Mirror preview">Mirror</button>
       </div>
-      <div class="metrics"><span><b id="fps">--</b> FPS</span><span>Quality <b id="quality">--</b>/9</span><span><b>1280x720</b></span></div>
+      <div class="metrics"><span><b id="fps">--</b> FPS</span><span>Q<b id="quality">--</b></span><span><b>1280x720</b></span></div>
     </div>
+    <div class="results"><div class="qr">QR <b id="qr">--</b></div><div id="objects" class="objects"><span class="empty">No objects</span></div></div>
   </main>
   <script>
-    const state=document.getElementById('state'),buttons=[...document.querySelectorAll('button[data-profile]')];
-    const stream=document.getElementById('stream');
-    let retryTimer=0,lastFrames=-1,lastProgressAt=Date.now();
+    const state=document.getElementById('state'),stream=document.getElementById('stream'),overlay=document.getElementById('overlay'),ctx=overlay.getContext('2d');
+    const buttons=[...document.querySelectorAll('button[data-profile]')],mirror=document.getElementById('mirror'),objects=document.getElementById('objects');
+    let retryTimer=0,lastFrames=-1,lastProgressAt=Date.now(),pollBusy=false,mirrored=false;
     function markLive(text){if(retryTimer){clearTimeout(retryTimer);retryTimer=0}state.textContent=text}
     function connectStream(){retryTimer=0;lastProgressAt=Date.now();state.textContent='Connecting';stream.src='http://'+location.hostname+':81/stream?t='+Date.now()}
     function reconnect(delay=1000){if(retryTimer)return;state.textContent='Reconnecting';retryTimer=setTimeout(connectStream,delay)}
     stream.onload=()=>{lastProgressAt=Date.now();markLive('Live')};
     stream.onerror=()=>reconnect();
-    async function status(){try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw new Error('status');const s=await r.json();
-      document.getElementById('fps').textContent=s.fps;document.getElementById('quality').textContent=s.quality;
-      buttons.forEach((b,i)=>b.classList.toggle('active',i===s.profile));const now=Date.now();
-      if(lastFrames<0){lastFrames=s.frames;lastProgressAt=now}else if(s.frames!==lastFrames){lastFrames=s.frames;lastProgressAt=now;markLive('Live | '+s.frames+' frames')}else if(now-lastProgressAt>5000){reconnect(250)}
-    }catch(e){if(!retryTimer)state.textContent='Control link lost'}}
-    buttons.forEach(b=>b.onclick=async()=>{buttons.forEach(x=>x.disabled=true);try{const r=await fetch('/api/profile?id='+b.dataset.profile,{cache:'no-store'});if(!r.ok)throw new Error('profile');await status()}finally{buttons.forEach(x=>x.disabled=false)}});
-    connectStream();status();setInterval(status,2000);
+    function draw(v){const w=overlay.width=overlay.clientWidth*devicePixelRatio,h=overlay.height=overlay.clientHeight*devicePixelRatio;ctx.clearRect(0,0,w,h);ctx.lineWidth=2*devicePixelRatio;ctx.font=(12*devicePixelRatio)+'px Arial';ctx.textBaseline='top';
+      v.objects.forEach(o=>{const x=(mirrored?1-o.box[2]:o.box[0])*w,y=o.box[1]*h,bw=(o.box[2]-o.box[0])*w,bh=(o.box[3]-o.box[1])*h,label=o.name+' '+o.score+'% '+o.color;ctx.strokeStyle='#50bd78';ctx.fillStyle='#50bd78';ctx.strokeRect(x,y,bw,bh);const tw=ctx.measureText(label).width+8*devicePixelRatio,lh=18*devicePixelRatio;ctx.fillRect(x,Math.max(0,y-lh),tw,lh);ctx.fillStyle='#07120b';ctx.fillText(label,x+4*devicePixelRatio,Math.max(0,y-lh)+2*devicePixelRatio)})}
+    function render(v){document.getElementById('fps').textContent=v.fps;document.getElementById('quality').textContent=v.quality;buttons.forEach((b,i)=>b.classList.toggle('active',i===v.profile));document.getElementById('qr').textContent=v.qr.fresh?v.qr.payload:'--';objects.replaceChildren();
+      if(v.objects.length){v.objects.forEach(o=>{const item=document.createElement('span');item.className='object';item.textContent=o.name+' '+o.score+'% | '+o.color+(o.color_confidence?' '+o.color_confidence+'%':'');objects.appendChild(item)})}else{const empty=document.createElement('span');empty.className='empty';empty.textContent='No objects';objects.appendChild(empty)}draw(v)}
+    async function poll(){if(pollBusy)return;pollBusy=true;try{const r=await fetch('/api/vision',{cache:'no-store'});if(!r.ok)throw new Error('vision');const v=await r.json();render(v);const now=Date.now();
+      if(lastFrames<0){lastFrames=v.stream_frames;lastProgressAt=now}else if(v.stream_frames!==lastFrames){lastFrames=v.stream_frames;lastProgressAt=now;markLive('Live')}else if(now-lastProgressAt>5000){reconnect(250)}
+    }catch(e){if(!retryTimer)state.textContent='Control link lost'}finally{pollBusy=false}}
+    buttons.forEach(b=>b.onclick=async()=>{buttons.forEach(x=>x.disabled=true);try{const r=await fetch('/api/profile?id='+b.dataset.profile,{cache:'no-store'});if(!r.ok)throw new Error('profile');await poll()}finally{buttons.forEach(x=>x.disabled=false)}});
+    mirror.onclick=()=>{mirrored=!mirrored;stream.classList.toggle('mirrored',mirrored);mirror.classList.toggle('active',mirrored);mirror.setAttribute('aria-pressed',String(mirrored));poll()};
+    addEventListener('resize',poll);connectStream();poll();setInterval(poll,1250);
   </script>
 </body>
 </html>)HTML";
@@ -103,13 +173,12 @@ bool writeAll(WiFiClient& client, const uint8_t* data, size_t length)
     uint32_t lastProgressMs = millis();
     while (sent < length && client.connected()) {
         size_t block = length - sent;
-        if (block > 1460) {
-            block = 1460;
+        if (block > TCP_WRITE_BLOCK_BYTES) {
+            block = TCP_WRITE_BLOCK_BYTES;
         }
-        const bool written = client.write(data + sent, block) > 0;
-        if (written) {
-            // AmebaPro2 reports write success as 1, not the transmitted byte count.
-            sent += block;
+        const size_t written = client.write(data + sent, block);
+        if (written > 0) {
+            sent += written;
             lastProgressMs = millis();
         } else {
             if (millis() - lastProgressMs >= CLIENT_WRITE_TIMEOUT_MS) {
@@ -186,25 +255,139 @@ void sendStatus(WiFiClient& client)
 {
     const int profileId = activeProfile;
     const StreamProfile& profile = PROFILES[profileId];
-    char json[460];
+    static OnDeviceVision::Status vision;
+    OnDeviceVision::getStatus(vision);
+    static char json[760];
     snprintf(json, sizeof(json),
-             "{\"version\":\"%s\",\"profile\":%d,\"name\":\"%s\","
+             "{\"version\":\"%s\",\"variant\":\"%s\",\"profile\":%d,\"name\":\"%s\","
              "\"fps\":%u,\"quality\":%u,\"width\":%u,\"height\":%u,"
-             "\"frames\":%lu,\"stream_clients\":%lu,\"stream_errors\":%lu,"
-             "\"stream_rejects\":%lu,"
+             "\"frames\":%lu,\"camera_frames\":%lu,\"capture_errors\":%lu,"
+             "\"stream_clients\":%lu,\"stream_errors\":%lu,"
+             "\"stream_rejects\":%lu,\"stream_stalls\":%lu,"
+             "\"max_capture_ms\":%lu,\"max_send_ms\":%lu,\"max_gap_ms\":%lu,"
+             "\"vision_enabled\":%s,\"vision_ready\":%s,\"qr_self_test\":%s,"
+             "\"vision_frames\":%lu,"
              "\"fc_enabled\":%s,\"fc_connected\":%s,\"fc_requests\":%lu,"
              "\"fc_responses\":%lu,\"fc_crc_errors\":%lu}",
-             BW21CAM_VERSION, profileId, profile.name, profile.fps, profile.jpegQuality,
+             BW21CAM_VERSION, BW21CAM_BUILD_VARIANT, profileId, profile.name,
+             profile.fps, profile.jpegQuality,
              BW21CAM_STREAM_WIDTH, BW21CAM_STREAM_HEIGHT,
              static_cast<unsigned long>(frameCount),
+             static_cast<unsigned long>(cameraFrameCount),
+             static_cast<unsigned long>(captureErrorCount),
              static_cast<unsigned long>(streamClientCount),
              static_cast<unsigned long>(streamErrorCount),
              static_cast<unsigned long>(streamRejectCount),
+             static_cast<unsigned long>(streamStallCount),
+             static_cast<unsigned long>(maxCaptureMs),
+             static_cast<unsigned long>(maxSendMs),
+             static_cast<unsigned long>(maxFrameGapMs),
+             vision.enabled ? "true" : "false",
+             vision.ready ? "true" : "false",
+             vision.qrSelfTestPassed ? "true" : "false",
+             static_cast<unsigned long>(vision.analyzedFrames),
              BW21CAM_ENABLE_FC_LINK ? "true" : "false",
              FcLink::connected() ? "true" : "false",
              static_cast<unsigned long>(FcLink::requestCount()),
              static_cast<unsigned long>(FcLink::responseCount()),
              static_cast<unsigned long>(FcLink::checksumErrorCount()));
+    sendResponse(client, 200, "OK", "application/json", json);
+}
+
+size_t appendText(char* destination, size_t capacity, size_t used, const char* format, ...)
+{
+    if (used >= capacity) return capacity;
+    va_list arguments;
+    va_start(arguments, format);
+    const int written = vsnprintf(destination + used, capacity - used, format, arguments);
+    va_end(arguments);
+    if (written < 0) return used;
+    const size_t amount = static_cast<size_t>(written);
+    return amount >= capacity - used ? capacity : used + amount;
+}
+
+size_t appendJsonString(char* destination, size_t capacity, size_t used, const char* value)
+{
+    used = appendText(destination, capacity, used, "\"");
+    for (const uint8_t* cursor = reinterpret_cast<const uint8_t*>(value); *cursor; cursor++) {
+        if (*cursor == '\\' || *cursor == '"') {
+            used = appendText(destination, capacity, used, "\\%c", *cursor);
+        } else if (*cursor >= 32 && *cursor != 127) {
+            used = appendText(destination, capacity, used, "%c", *cursor);
+        }
+    }
+    return appendText(destination, capacity, used, "\"");
+}
+
+void sendVision(WiFiClient& client)
+{
+    static OnDeviceVision::Status vision;
+    OnDeviceVision::getStatus(vision);
+    const uint32_t now = millis();
+    const uint32_t qrAge = vision.qrSeenAtMs ? now - vision.qrSeenAtMs : 0;
+    const uint32_t objectAge = vision.objectSeenAtMs ? now - vision.objectSeenAtMs : 0;
+    const bool qrFresh = vision.qrSeenAtMs && qrAge <= BW21CAM_QR_STALE_MS;
+    const bool objectsFresh = vision.objectSeenAtMs && objectAge <= BW21CAM_OBJECT_STALE_MS;
+    const uint32_t qrAccountedFrames = vision.qrCheckedFrames + vision.jpegDecodeErrors;
+    const uint32_t qrBypassedFrames = vision.analyzedFrames > qrAccountedFrames
+                                         ? vision.analyzedFrames - qrAccountedFrames
+                                         : 0;
+
+    static char json[2600];
+    size_t used = appendText(
+        json, sizeof(json), 0,
+        "{\"profile\":%d,\"fps\":%u,\"quality\":%u,\"stream_frames\":%lu,"
+        "\"enabled\":%s,\"ready\":%s,\"frame_sequence\":%lu,\"frames\":%lu,"
+        "\"jpeg_errors\":%lu,\"process_ms\":%lu,\"max_process_ms\":%lu,"
+        "\"qr_self_test\":%s,\"qr_luma\":[%u,%u,%u],\"qr_last_detail\":%d,"
+        "\"qr_checked_frames\":%lu,\"qr_scan_passes\":%lu,"
+        "\"qr_enhanced_scans\":%lu,\"qr_bypassed_frames\":%lu,"
+        "\"qr\":{\"fresh\":%s,\"age_ms\":%lu,\"sequence\":%lu,\"payload\":",
+        activeProfile, PROFILES[activeProfile].fps, PROFILES[activeProfile].jpegQuality,
+        static_cast<unsigned long>(frameCount),
+        vision.enabled ? "true" : "false", vision.ready ? "true" : "false",
+        static_cast<unsigned long>(vision.frameSequence),
+        static_cast<unsigned long>(vision.analyzedFrames),
+        static_cast<unsigned long>(vision.jpegDecodeErrors),
+        static_cast<unsigned long>(vision.lastProcessMs),
+        static_cast<unsigned long>(vision.maxProcessMs),
+        vision.qrSelfTestPassed ? "true" : "false",
+        vision.qrDarkest, vision.qrMean, vision.qrBrightest,
+        static_cast<int>(vision.qrLastScanDetail),
+        static_cast<unsigned long>(vision.qrCheckedFrames),
+        static_cast<unsigned long>(vision.qrScanPasses),
+        static_cast<unsigned long>(vision.qrEnhancedScans),
+        static_cast<unsigned long>(qrBypassedFrames),
+        qrFresh ? "true" : "false",
+        static_cast<unsigned long>(qrAge), static_cast<unsigned long>(vision.qrSequence));
+    used = appendJsonString(json, sizeof(json), used, qrFresh ? vision.qrPayload : "");
+    used = appendText(
+        json, sizeof(json), used,
+        ",\"candidates\":%lu,\"no_finder\":%lu,\"decodes\":%lu,"
+        "\"decode_errors\":%lu,\"duplicates\":%lu},"
+        "\"objects_fresh\":%s,\"objects_age_ms\":%lu,"
+        "\"yolo_frames\":%lu,\"objects\":[",
+        static_cast<unsigned long>(vision.qrCandidates),
+        static_cast<unsigned long>(vision.qrNoFinderCenters),
+        static_cast<unsigned long>(vision.qrDecodes),
+        static_cast<unsigned long>(vision.qrDecodeErrors),
+        static_cast<unsigned long>(vision.qrDuplicates), objectsFresh ? "true" : "false",
+        static_cast<unsigned long>(objectAge), static_cast<unsigned long>(vision.yoloFrames));
+    if (objectsFresh) {
+        for (uint8_t i = 0; i < vision.objectCount; i++) {
+            const OnDeviceVision::ObjectResult& object = vision.objects[i];
+            used = appendText(json, sizeof(json), used, "%s{\"name\":", i ? "," : "");
+            used = appendJsonString(json, sizeof(json), used, object.name);
+            used = appendText(json, sizeof(json), used, ",\"score\":%u,\"color\":", object.score);
+            used = appendJsonString(json, sizeof(json), used, object.color);
+            used = appendText(
+                json, sizeof(json), used,
+                ",\"color_confidence\":%u,\"box\":[%.3f,%.3f,%.3f,%.3f]}",
+                object.colorConfidence, object.xMin, object.yMin, object.xMax, object.yMax);
+        }
+    }
+    appendText(json, sizeof(json), used, "]}");
+    json[sizeof(json) - 1] = 0;
     sendResponse(client, 200, "OK", "application/json", json);
 }
 
@@ -219,6 +402,8 @@ void handleControlClient(WiFiClient& client)
 
     if (requestTargets(request, "/api/status")) {
         sendStatus(client);
+    } else if (requestTargets(request, "/api/vision")) {
+        sendVision(client);
     } else if (requestTargets(request, "/api/profile")) {
         const char* id = strstr(request, "?id=");
         char* end = nullptr;
@@ -256,7 +441,6 @@ void applyPendingProfile()
     streamConfig.setJpegQuality(profile.jpegQuality);
     Camera.configVideoChannel(CAMERA_CHANNEL, streamConfig);
     Camera.updateVideoParams(CAMERA_CHANNEL);
-    Camera.setFPS(profile.fps);
     activeProfile = requested;
 
     Serial.print("Video profile: ");
@@ -284,8 +468,46 @@ void controlTask(void*)
     for (;;) {
         WiFiClient client = controlServer.available();
         if (client) {
+            if (!configureAcceptedSocket(BW21CAM_CONTROL_PORT)) {
+                Serial.println("Control socket timeout configuration failed");
+            }
             handleControlClient(client);
         }
+    }
+}
+
+bool captureCameraFrame(uint32_t& imageAddress, uint32_t& imageLength,
+                        uint32_t& frameStartedMs)
+{
+    frameStartedMs = millis();
+    Camera.getImage(CAMERA_CHANNEL, &imageAddress, &imageLength);
+    const uint32_t captureDurationMs = millis() - frameStartedMs;
+    if (captureDurationMs > maxCaptureMs) maxCaptureMs = captureDurationMs;
+    if (!imageAddress || !imageLength) {
+        captureErrorCount++;
+        return false;
+    }
+
+    cameraFrameCount++;
+    const uint32_t capturedMs = millis();
+    if (lastCameraFrameMs) {
+        const uint32_t frameGapMs = capturedMs - lastCameraFrameMs;
+        if (frameGapMs > maxFrameGapMs) maxFrameGapMs = frameGapMs;
+        if (frameGapMs > FRAME_STALL_THRESHOLD_MS) streamStallCount++;
+    }
+    lastCameraFrameMs = capturedMs;
+    return true;
+}
+
+void finishFrameInterval(uint32_t frameStartedMs)
+{
+    const uint32_t frameIntervalMs = 1000U / PROFILES[activeProfile].fps;
+    const uint32_t elapsedMs = millis() - frameStartedMs;
+    if (elapsedMs < frameIntervalMs) {
+        const uint32_t waitMs = frameIntervalMs - elapsedMs;
+        TickType_t waitTicks = waitMs / portTICK_PERIOD_MS;
+        if (!waitTicks) waitTicks = 1;
+        vTaskDelay(waitTicks);
     }
 }
 
@@ -318,6 +540,9 @@ void streamTask(void*)
 
         streamClientCount++;
         Serial.println("Camera viewer connected");
+        if (!configureAcceptedSocket(BW21CAM_STREAM_PORT)) {
+            Serial.println("Stream socket timeout configuration failed");
+        }
         if (!sendStreamHeader(client)) {
             streamErrorCount++;
             client.stop();
@@ -326,12 +551,10 @@ void streamTask(void*)
 
         while (client.connected()) {
             applyPendingProfile();
-            const uint32_t frameStartedMs = millis();
             uint32_t imageAddress = 0;
             uint32_t imageLength = 0;
-            Camera.getImage(CAMERA_CHANNEL, &imageAddress, &imageLength);
-            if (!imageAddress || !imageLength) {
-                streamErrorCount++;
+            uint32_t frameStartedMs = 0;
+            if (!captureCameraFrame(imageAddress, imageLength, frameStartedMs)) {
                 vTaskDelay(2 / portTICK_PERIOD_MS);
                 continue;
             }
@@ -340,19 +563,21 @@ void streamTask(void*)
             snprintf(partHeader, sizeof(partHeader),
                      "Content-Type: image/jpeg\r\nContent-Length: %lu\r\n\r\n",
                      static_cast<unsigned long>(imageLength));
-            if (!writeText(client, partHeader) ||
-                !writeAll(client, reinterpret_cast<const uint8_t*>(imageAddress), imageLength) ||
-                !writeText(client, "\r\n--bw21frame\r\n")) {
+            const uint32_t sendStartedMs = millis();
+            const bool frameSent =
+                writeText(client, partHeader) &&
+                writeAll(client, reinterpret_cast<const uint8_t*>(imageAddress), imageLength) &&
+                writeText(client, "\r\n--bw21frame\r\n");
+            const uint32_t sendDurationMs = millis() - sendStartedMs;
+            if (sendDurationMs > maxSendMs) {
+                maxSendMs = sendDurationMs;
+            }
+            if (!frameSent) {
                 streamErrorCount++;
                 break;
             }
             frameCount++;
-
-            const uint32_t frameIntervalMs = 1000U / PROFILES[activeProfile].fps;
-            const uint32_t elapsedMs = millis() - frameStartedMs;
-            if (elapsedMs < frameIntervalMs) {
-                vTaskDelay((frameIntervalMs - elapsedMs) / portTICK_PERIOD_MS);
-            }
+            finishFrameInterval(frameStartedMs);
         }
 
         client.stop();
@@ -399,8 +624,15 @@ void startCamera()
 {
     streamConfig.setJpegQuality(PROFILES[DEFAULT_PROFILE].jpegQuality);
     Camera.configVideoChannel(CAMERA_CHANNEL, streamConfig);
+    OnDeviceVision::configureCamera();
     Camera.videoInit();
+#if BW21CAM_ENABLE_LENS_DISTORTION_CORRECTION
+    cameraSettings.setLDC(1);
+#endif
     Camera.channelBegin(CAMERA_CHANNEL);
+    if (!OnDeviceVision::begin()) {
+        Serial.println("On-device vision initialization failed");
+    }
     Camera.printInfo();
 }
 
@@ -422,12 +654,54 @@ void printPeriodicStatus()
     Serial.print(profile.jpegQuality);
     Serial.print(" frames=");
     Serial.print(frameCount);
+    Serial.print(" camera_frames=");
+    Serial.print(cameraFrameCount);
+    Serial.print(" capture_errors=");
+    Serial.print(captureErrorCount);
     Serial.print(" stream_errors=");
     Serial.print(streamErrorCount);
     Serial.print(" stream_clients=");
     Serial.print(streamClientCount);
     Serial.print(" stream_rejects=");
     Serial.print(streamRejectCount);
+    Serial.print(" stalls=");
+    Serial.print(streamStallCount);
+    Serial.print(" max_capture_ms=");
+    Serial.print(maxCaptureMs);
+    Serial.print(" max_send_ms=");
+    Serial.print(maxSendMs);
+    Serial.print(" max_gap_ms=");
+    Serial.print(maxFrameGapMs);
+#if BW21CAM_ENABLE_ONDEVICE_VISION
+    OnDeviceVision::Status vision = {};
+    OnDeviceVision::getStatus(vision);
+    const uint32_t qrAccountedFrames = vision.qrCheckedFrames + vision.jpegDecodeErrors;
+    const uint32_t qrBypassedFrames = vision.analyzedFrames > qrAccountedFrames
+                                         ? vision.analyzedFrames - qrAccountedFrames
+                                         : 0;
+    Serial.print(" vision_frames=");
+    Serial.print(vision.analyzedFrames);
+    Serial.print(" qr_checked=");
+    Serial.print(vision.qrCheckedFrames);
+    Serial.print(" qr_bypassed=");
+    Serial.print(qrBypassedFrames);
+    Serial.print(" vision_ms=");
+    Serial.print(vision.lastProcessMs);
+    Serial.print(" qr_decodes=");
+    Serial.print(vision.qrDecodes);
+    Serial.print(" qr_self_test=");
+    Serial.print(vision.qrSelfTestPassed ? "PASS" : "FAIL");
+    Serial.print(" qr_detail=");
+    Serial.print(static_cast<int>(vision.qrLastScanDetail));
+    Serial.print(" qr_luma=");
+    Serial.print(vision.qrDarkest);
+    Serial.print('/');
+    Serial.print(vision.qrMean);
+    Serial.print('/');
+    Serial.print(vision.qrBrightest);
+    Serial.print(" objects=");
+    Serial.print(vision.objectCount);
+#endif
 #if BW21CAM_ENABLE_FC_LINK
     Serial.print(" fc=");
     Serial.print(FcLink::connected() ? "connected" : "waiting");
@@ -439,6 +713,59 @@ void printPeriodicStatus()
     Serial.println();
 }
 
+void printVisionEvents()
+{
+#if BW21CAM_ENABLE_ONDEVICE_VISION
+    static uint32_t lastCheckMs = 0;
+    static uint32_t lastQrSequence = 0;
+    static uint32_t lastObjectReportMs = 0;
+    static bool hadObjects = false;
+    const uint32_t now = millis();
+    if (now - lastCheckMs < 100) return;
+    lastCheckMs = now;
+
+    OnDeviceVision::Status vision = {};
+    OnDeviceVision::getStatus(vision);
+    if (vision.qrSequence != lastQrSequence && vision.qrPayload[0]) {
+        lastQrSequence = vision.qrSequence;
+        Serial.print("VISION QR payload=");
+        Serial.println(vision.qrPayload);
+    }
+
+    if (!vision.objectCount) {
+        if (hadObjects) Serial.println("VISION objects=none");
+        hadObjects = false;
+        return;
+    }
+    if (now - lastObjectReportMs < 1000) return;
+
+    lastObjectReportMs = now;
+    hadObjects = true;
+    Serial.print("VISION objects=");
+    Serial.print(vision.objectCount);
+    for (uint8_t i = 0; i < vision.objectCount; i++) {
+        const OnDeviceVision::ObjectResult& object = vision.objects[i];
+        Serial.print(" | ");
+        Serial.print(object.name);
+        Serial.print(" score=");
+        Serial.print(object.score);
+        Serial.print(" color=");
+        Serial.print(object.color);
+        Serial.print(" color_conf=");
+        Serial.print(object.colorConfidence);
+        Serial.print(" box=");
+        Serial.print(object.xMin, 3);
+        Serial.print(',');
+        Serial.print(object.yMin, 3);
+        Serial.print(',');
+        Serial.print(object.xMax, 3);
+        Serial.print(',');
+        Serial.print(object.yMax, 3);
+    }
+    Serial.println();
+#endif
+}
+
 }  // namespace
 
 void setup()
@@ -448,6 +775,8 @@ void setup()
     Serial.println();
     Serial.print("BW21-CBV Cam Drone ");
     Serial.println(BW21CAM_VERSION);
+    Serial.print("Build variant: ");
+    Serial.println(BW21CAM_BUILD_VARIANT);
 
     startWifi();
     startCamera();
@@ -456,7 +785,7 @@ void setup()
     controlServer.begin();
     streamServer.begin();
     const BaseType_t controlStarted =
-        xTaskCreate(controlTask, "CameraControl", 4 * 1024, nullptr, 1, nullptr);
+        xTaskCreate(controlTask, "CameraControl", 10 * 1024, nullptr, 1, nullptr);
     const BaseType_t streamStarted =
         xTaskCreate(streamTask, "CameraStream", 10 * 1024, nullptr, 2, nullptr);
     if (controlStarted != pdPASS || streamStarted != pdPASS) {
@@ -472,6 +801,17 @@ void loop()
 {
     FcLink::update();
 
+#if BW21CAM_ENABLE_ONDEVICE_VISION && BW21CAM_ENABLE_FC_LINK
+    static uint32_t publishedQrSequence = 0;
+    OnDeviceVision::Status vision = {};
+    OnDeviceVision::getStatus(vision);
+    if (vision.qrSequence != publishedQrSequence && vision.qrPayload[0] &&
+        FcLink::publishQr(vision.qrPayload)) {
+        publishedQrSequence = vision.qrSequence;
+    }
+#endif
+
     printPeriodicStatus();
+    printVisionEvents();
     delay(1);
 }

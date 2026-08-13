@@ -20,6 +20,7 @@ env = DefaultEnvironment()
 PROJECT_DIR = Path(env.subst("$PROJECT_DIR"))
 BUILD_DIR = Path(env.subst("$BUILD_DIR"))
 SRC_DIR = Path(env.subst("$PROJECT_SRC_DIR"))
+QUIRC_VENDOR_DIR = PROJECT_DIR / "vendor" / "esp32-qrcode-reader"
 PROJECT_KEY = hashlib.sha1(
     f"{PROJECT_DIR}:{env.subst('$PIOENV')}".encode("utf-8")
 ).hexdigest()[:10]
@@ -33,6 +34,7 @@ ARDUINO_CONFIG = TOOLS_DIR / "arduino-cli.yaml"
 SKETCH_DIR = WORK_DIR / "sketch" / "BW21Cam"
 ARDUINO_BUILD_DIR = WORK_DIR / "arduino-build"
 ARDUINO_OUTPUT_DIR = BUILD_DIR / "firmware"
+UPLOAD_COMPONENT_DIR = ARDUINO_OUTPUT_DIR / "uploader"
 BUILD_STAMP = BUILD_DIR / "bw21-build.json"
 REALTEK_TOOL_LOCK = TOOLS_DIR / "realtek-tools.lock"
 CLI_COMPAT_HELPER = (
@@ -56,6 +58,13 @@ NN_MODELS_SHA256 = "acb3c512fe8e84531409b6cd4954dee84a63f7cdb9529479699af881b8fb
 NN_MODEL_KEYS = ["yolov4_tiny"]
 MIN_FIRMWARE_BYTES_WITH_MODEL = 4 * 1024 * 1024
 REALTEK_TOOL_LOCK_TIMEOUT_SECONDS = 15 * 60
+REALTEK_UPLOAD_COMPONENTS = (
+    "firmware.bin",
+    "firmware_isp_iq.bin",
+    "system_files.bin",
+    "nn_model.bin",
+)
+REALTEK_REQUIRED_UPLOAD_COMPONENTS = REALTEK_UPLOAD_COMPONENTS[:3]
 
 
 def cli_executable():
@@ -515,27 +524,81 @@ def validated_upload_image():
         mismatches.append(
             f"flash_sha256={manifest.get('flash_sha256')!r} (actual {digest!r})"
         )
+    component_hashes = manifest.get("upload_components")
+    if not isinstance(component_hashes, dict):
+        mismatches.append("upload_components is missing")
+        component_hashes = {}
+    required_components = list(REALTEK_REQUIRED_UPLOAD_COMPONENTS)
+    if ONDEVICE_VISION == "1":
+        required_components.append("nn_model.bin")
+    for name in required_components:
+        component_path = UPLOAD_COMPONENT_DIR / name
+        expected_digest = component_hashes.get(name)
+        if not component_path.is_file():
+            mismatches.append(f"upload component {name!r} is missing")
+        elif expected_digest != sha256_file(component_path):
+            mismatches.append(f"upload component {name!r} failed its hash check")
     if mismatches:
         raise RuntimeError("Refusing mismatched upload artifact: " + "; ".join(mismatches))
     verify_embedded_variant(image_path, expected["variant"])
-    return image_path, digest
+    verify_embedded_variant(UPLOAD_COMPONENT_DIR / "firmware.bin", expected["variant"])
+    return image_path, digest, component_hashes
 
 
-def stage_realtek_upload_image(image_path, expected_digest, core_version):
+def replace_checked(source, destination, expected_digest):
+    temporary = destination.with_name(f"{destination.name}.{os.getpid()}.tmp")
+    try:
+        shutil.copy2(source, temporary)
+        if sha256_file(temporary) != expected_digest:
+            raise RuntimeError(f"Staged file failed its hash check: {source.name}")
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    if sha256_file(destination) != expected_digest:
+        raise RuntimeError(f"Staged file changed unexpectedly: {destination.name}")
+
+
+def stage_realtek_upload_image(image_path, expected_digest, component_hashes, core_version):
     uploader_dir = realtek_uploader_directory(core_version)
     shared_image = uploader_dir / "flash_ntz.bin"
-    temporary_image = uploader_dir / f"flash_ntz.{os.getpid()}.tmp"
-    try:
-        shutil.copy2(image_path, temporary_image)
-        if sha256_file(temporary_image) != expected_digest:
-            raise RuntimeError("The staged Realtek upload image failed its hash check")
-        os.replace(temporary_image, shared_image)
-    finally:
-        if temporary_image.exists():
-            temporary_image.unlink()
-    if sha256_file(shared_image) != expected_digest:
-        raise RuntimeError("The Realtek uploader image changed while it was staged")
-    return shared_image
+    replace_checked(image_path, shared_image, expected_digest)
+
+    staged = {"flash_ntz.bin": (shared_image, expected_digest)}
+    for name in REALTEK_UPLOAD_COMPONENTS:
+        destination = uploader_dir / name
+        component_digest = component_hashes.get(name)
+        if component_digest is None:
+            if destination.exists() and name == "nn_model.bin":
+                destination.unlink()
+            continue
+        source = UPLOAD_COMPONENT_DIR / name
+        replace_checked(source, destination, component_digest)
+        staged[name] = (destination, component_digest)
+    return staged
+
+
+def capture_realtek_upload_components(core_version):
+    uploader_dir = realtek_uploader_directory(core_version)
+    captured_dir = WORK_DIR / "upload-components"
+    if captured_dir.exists():
+        shutil.rmtree(captured_dir)
+    captured_dir.mkdir(parents=True)
+
+    required_components = list(REALTEK_REQUIRED_UPLOAD_COMPONENTS)
+    if ONDEVICE_VISION == "1":
+        required_components.append("nn_model.bin")
+    for name in REALTEK_UPLOAD_COMPONENTS:
+        source = uploader_dir / name
+        if source.is_file() and (name != "nn_model.bin" or ONDEVICE_VISION == "1"):
+            shutil.copy2(source, captured_dir / name)
+    missing = [name for name in required_components if not (captured_dir / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            "Realtek postbuild did not produce upload component(s): " + ", ".join(missing)
+        )
+    verify_embedded_variant(captured_dir / "firmware.bin", env.subst("$PIOENV"))
+    return captured_dir
 
 
 def stage_sources():
@@ -545,6 +608,19 @@ def stage_sources():
     for source in SRC_DIR.iterdir():
         if source.is_file() and source.suffix.lower() in (".cpp", ".c", ".h", ".hpp"):
             shutil.copy2(source, SKETCH_DIR / source.name)
+    if ONDEVICE_VISION == "1":
+        quirc_sources = [
+            source
+            for source in QUIRC_VENDOR_DIR.rglob("*")
+            if source.is_file() and source.suffix.lower() in (".c", ".h")
+        ]
+        if not quirc_sources:
+            raise RuntimeError(f"Missing vendored quirc sources: {QUIRC_VENDOR_DIR}")
+        for source in quirc_sources:
+            destination = SKETCH_DIR / source.name
+            if destination.exists():
+                raise RuntimeError(f"Duplicate staged quirc source name: {source.name}")
+            shutil.copy2(source, destination)
     (SKETCH_DIR / "BuildConfig.h").write_text(
         "#pragma once\n"
         f"#define BW21CAM_ENABLE_FC_LINK {FC_LINK}\n"
@@ -576,6 +652,8 @@ def build_firmware(target, source, env):
     try:
         ensure_toolchain()
         stage_sources()
+        _, _, core_version = CORE_SPEC.partition("@")
+        captured_components = None
         compile_arguments = [
             "compile",
             "--fqbn",
@@ -596,13 +674,13 @@ def build_firmware(target, source, env):
                         # The official prebuild hook consumes this temporary tool package.
                         ensure_nn_models()
                     run_cli(compile_arguments)
+                    captured_components = capture_realtek_upload_components(core_version)
                 break
             except RuntimeError:
                 if attempt == 3:
                     raise
                 print(f"Realtek compiler failed; retrying ({attempt}/3)...")
                 time.sleep(1)
-        _, _, core_version = CORE_SPEC.partition("@")
         vision_image = verify_vision_image(
             ARDUINO_BUILD_DIR / "flash_ntz.bin", core_version
         )
@@ -612,6 +690,14 @@ def build_firmware(target, source, env):
             if not artifact.is_file():
                 raise RuntimeError(f"Expected build artifact was not produced: {artifact}")
             shutil.copy2(artifact, ARDUINO_OUTPUT_DIR / artifact_name)
+        if UPLOAD_COMPONENT_DIR.exists():
+            shutil.rmtree(UPLOAD_COMPONENT_DIR)
+        shutil.copytree(captured_components, UPLOAD_COMPONENT_DIR)
+        upload_components = {
+            component.name: sha256_file(component)
+            for component in sorted(UPLOAD_COMPONENT_DIR.iterdir())
+            if component.is_file()
+        }
         flash_sha256 = sha256_file(ARDUINO_OUTPUT_DIR / "flash_ntz.bin")
         BUILD_STAMP.write_text(
             json.dumps(
@@ -623,6 +709,7 @@ def build_firmware(target, source, env):
                     "fc_link": FC_LINK,
                     "ondevice_vision": ONDEVICE_VISION,
                     "flash_sha256": flash_sha256,
+                    "upload_components": upload_components,
                     "vision_image": vision_image,
                 },
                 indent=2,
@@ -675,14 +762,16 @@ def detect_upload_port():
 def upload_firmware(target, source, env):
     try:
         ensure_toolchain()
-        image_path, image_digest = validated_upload_image()
+        image_path, image_digest, component_hashes = validated_upload_image()
         _, _, core_version = CORE_SPEC.partition("@")
         port = detect_upload_port()
         with realtek_tool_lock():
-            shared_image = stage_realtek_upload_image(
-                image_path, image_digest, core_version
+            staged_files = stage_realtek_upload_image(
+                image_path, image_digest, component_hashes, core_version
             )
-            verify_embedded_variant(shared_image, env.subst("$PIOENV"))
+            verify_embedded_variant(
+                staged_files["firmware.bin"][0], env.subst("$PIOENV")
+            )
             print(
                 f"Staged {env.subst('$PIOENV')} upload image: "
                 f"sha256={image_digest}"
@@ -700,8 +789,16 @@ def upload_firmware(target, source, env):
                 ],
                 capture=True,
             )
-            if sha256_file(shared_image) != image_digest:
-                raise RuntimeError("The Realtek upload image changed during flashing")
+            changed = [
+                name
+                for name, (path, digest) in staged_files.items()
+                if not path.is_file() or sha256_file(path) != digest
+            ]
+            if changed:
+                raise RuntimeError(
+                    "Realtek upload component changed during flashing: "
+                    + ", ".join(changed)
+                )
         failure_markers = ("upload fail", "uart boot fail", "flashloader loading fail")
         if any(marker in upload_output.lower() for marker in failure_markers):
             raise RuntimeError("Realtek uploader reported a flash failure")
@@ -712,6 +809,11 @@ def upload_firmware(target, source, env):
 
 
 source_nodes = [env.File(str(path)) for path in SRC_DIR.iterdir() if path.is_file()]
+source_nodes.extend(
+    env.File(str(path))
+    for path in QUIRC_VENDOR_DIR.rglob("*")
+    if path.is_file()
+)
 source_nodes.extend(
     [
         env.File(str(PROJECT_DIR / "platformio.ini")),

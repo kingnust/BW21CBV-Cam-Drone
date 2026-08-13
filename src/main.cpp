@@ -172,12 +172,12 @@ const char INDEX_HTML[] = R"HTML(<!doctype html>
     header{margin-bottom:10px}h1{margin:0;font-size:22px;letter-spacing:0}.state{color:#aab4bf;font-size:13px}
     .viewer{position:relative;width:100%;aspect-ratio:16/9;background:#050607;border:1px solid #333a43;overflow:hidden}
     .viewer img,.viewer canvas{position:absolute;inset:0;width:100%;height:100%}.viewer img{display:block;object-fit:contain}.viewer img.mirrored{transform:scaleX(-1)}.viewer canvas{pointer-events:none}
-    .toolbar{padding:10px 0;flex-wrap:wrap}.controls{display:flex;gap:8px;flex-wrap:wrap}.modes{display:inline-grid;grid-template-columns:repeat(3,1fr);border:1px solid #3d4650}
+    .toolbar{padding:10px 0;flex-wrap:wrap}.controls{display:flex;gap:8px;flex-wrap:wrap}.modes,.vision-modes{display:inline-grid;border:1px solid #3d4650}.modes{grid-template-columns:repeat(3,1fr)}.vision-modes{grid-template-columns:repeat(2,1fr)}
     button{height:38px;padding:0 12px;border:1px solid #3d4650;background:#1c2229;color:#eef2f5;font-weight:700;cursor:pointer}button.active{background:#50bd78;color:#07120b;border-color:#50bd78}button:disabled{opacity:.55;cursor:wait}
-    .modes,.modes button{min-width:0}.modes button{border-width:0 1px 0 0}.modes button:last-child{border-right:0}.metrics{display:flex;gap:14px;color:#b9c3cd;font-size:13px}.metrics b{color:#f1c75b}
+    .modes,.modes button,.vision-modes,.vision-modes button{min-width:0}.modes button,.vision-modes button{border-width:0 1px 0 0}.modes button:last-child,.vision-modes button:last-child{border-right:0}.metrics{display:flex;gap:14px;color:#b9c3cd;font-size:13px}.metrics b{color:#f1c75b}
     .results{border-top:1px solid #303741;padding-top:10px}.qr{font-size:14px;color:#b9c3cd;overflow-wrap:anywhere}.qr b{color:#f4f6f8}.objects{display:flex;gap:8px;flex-wrap:wrap;margin-top:9px;min-height:30px}
     .object{padding:6px 8px;border-left:3px solid #50bd78;background:#1a2026;color:#e6ebef;font-size:13px}.empty{color:#8f9aa5;font-size:13px}
-    @media(max-width:560px){main{padding:10px}header{align-items:flex-start;flex-wrap:wrap}.toolbar{align-items:flex-start}.controls,.modes{width:100%}.modes button{padding:0 4px}.metrics{width:100%;justify-content:space-between;gap:6px}}
+    @media(max-width:560px){main{padding:10px}header{align-items:flex-start;flex-wrap:wrap}.toolbar{align-items:flex-start}.controls,.modes,.vision-modes{width:100%}.modes button,.vision-modes button{padding:0 4px}.metrics{width:100%;justify-content:space-between;gap:6px}}
   </style>
 </head>
 <body>
@@ -189,6 +189,9 @@ const char INDEX_HTML[] = R"HTML(<!doctype html>
         <div class="modes" aria-label="Video profile">
           <button data-profile="0">Smooth</button><button data-profile="1">Balanced</button><button data-profile="2">Detail</button>
         </div>
+        <div class="vision-modes" aria-label="Vision mode">
+          <button data-vision="0">Camera</button><button data-vision="1">Vision</button>
+        </div>
         <button id="mirror" type="button" aria-pressed="false" title="Mirror preview">Mirror</button>
       </div>
       <div class="metrics"><span><b id="fps">--</b> FPS</span><span>Q<b id="quality">--</b></span><span><b>1280x720</b></span></div>
@@ -197,21 +200,22 @@ const char INDEX_HTML[] = R"HTML(<!doctype html>
   </main>
   <script>
     const state=document.getElementById('state'),stream=document.getElementById('stream'),overlay=document.getElementById('overlay'),ctx=overlay.getContext('2d');
-    const buttons=[...document.querySelectorAll('button[data-profile]')],mirror=document.getElementById('mirror'),objects=document.getElementById('objects');
-    let retryTimer=0,lastFrames=-1,lastProgressAt=Date.now(),pollBusy=false,mirrored=false;
+    const buttons=[...document.querySelectorAll('button[data-profile]')],visionButtons=[...document.querySelectorAll('button[data-vision]')],mirror=document.getElementById('mirror'),objects=document.getElementById('objects');
+    let retryTimer=0,lastFrames=-1,lastProgressAt=Date.now(),pollBusy=false,visionSwitchBusy=false,mirrored=false;
     function markLive(text){if(retryTimer){clearTimeout(retryTimer);retryTimer=0}state.textContent=text}
     function connectStream(){retryTimer=0;lastProgressAt=Date.now();state.textContent='Connecting';stream.src='http://'+location.hostname+':81/stream?t='+Date.now()}
     function reconnect(delay=1000){if(retryTimer)return;state.textContent='Reconnecting';retryTimer=setTimeout(connectStream,delay)}
     stream.onload=()=>{lastProgressAt=Date.now();markLive('Live')};
     stream.onerror=()=>reconnect();
-    function draw(v){const w=overlay.width=overlay.clientWidth*devicePixelRatio,h=overlay.height=overlay.clientHeight*devicePixelRatio;ctx.clearRect(0,0,w,h);ctx.lineWidth=2*devicePixelRatio;ctx.font=(12*devicePixelRatio)+'px Arial';ctx.textBaseline='top';
+    function draw(v){const w=overlay.width=overlay.clientWidth*devicePixelRatio,h=overlay.height=overlay.clientHeight*devicePixelRatio;ctx.clearRect(0,0,w,h);if(!v.enabled)return;ctx.lineWidth=2*devicePixelRatio;ctx.font=(12*devicePixelRatio)+'px Arial';ctx.textBaseline='top';
       v.objects.forEach(o=>{const x=(mirrored?1-o.box[2]:o.box[0])*w,y=o.box[1]*h,bw=(o.box[2]-o.box[0])*w,bh=(o.box[3]-o.box[1])*h,label=o.name+' '+o.score+'% '+o.color;ctx.strokeStyle='#50bd78';ctx.fillStyle='#50bd78';ctx.strokeRect(x,y,bw,bh);const tw=ctx.measureText(label).width+8*devicePixelRatio,lh=18*devicePixelRatio;ctx.fillRect(x,Math.max(0,y-lh),tw,lh);ctx.fillStyle='#07120b';ctx.fillText(label,x+4*devicePixelRatio,Math.max(0,y-lh)+2*devicePixelRatio)})}
-    function render(v){document.getElementById('fps').textContent=v.fps;document.getElementById('quality').textContent=v.quality;buttons.forEach((b,i)=>b.classList.toggle('active',i===v.profile));document.getElementById('qr').textContent=v.qr.fresh?v.qr.payload:'--';objects.replaceChildren();
-      if(v.objects.length){v.objects.forEach(o=>{const item=document.createElement('span');item.className='object';item.textContent=o.name+' '+o.score+'% | '+o.color+(o.color_confidence?' '+o.color_confidence+'%':'');objects.appendChild(item)})}else{const empty=document.createElement('span');empty.className='empty';empty.textContent='No objects';objects.appendChild(empty)}draw(v)}
+    function render(v){document.getElementById('fps').textContent=v.fps;document.getElementById('quality').textContent=v.quality;buttons.forEach((b,i)=>b.classList.toggle('active',i===v.profile));visionButtons.forEach((b,i)=>{b.classList.toggle('active',i===Number(v.enabled));b.disabled=visionSwitchBusy||!v.ready});document.getElementById('qr').textContent=v.enabled&&v.qr.fresh?v.qr.payload:'--';objects.replaceChildren();
+      if(!v.enabled){const empty=document.createElement('span');empty.className='empty';empty.textContent=v.ready?'Vision off':'Vision unavailable';objects.appendChild(empty)}else if(v.objects.length){v.objects.forEach(o=>{const item=document.createElement('span');item.className='object';item.textContent=o.name+' '+o.score+'% | '+o.color+(o.color_confidence?' '+o.color_confidence+'%':'');objects.appendChild(item)})}else{const empty=document.createElement('span');empty.className='empty';empty.textContent='No objects';objects.appendChild(empty)}draw(v)}
     async function poll(){if(pollBusy)return;pollBusy=true;try{const r=await fetch('/api/vision',{cache:'no-store'});if(!r.ok)throw new Error('vision');const v=await r.json();render(v);const now=Date.now();
       if(lastFrames<0){lastFrames=v.stream_frames;lastProgressAt=now}else if(v.stream_frames!==lastFrames){lastFrames=v.stream_frames;lastProgressAt=now;markLive('Live')}else if(now-lastProgressAt>5000){reconnect(250)}
     }catch(e){if(!retryTimer)state.textContent='Control link lost'}finally{pollBusy=false}}
     buttons.forEach(b=>b.onclick=async()=>{buttons.forEach(x=>x.disabled=true);try{const r=await fetch('/api/profile?id='+b.dataset.profile,{cache:'no-store'});if(!r.ok)throw new Error('profile');await poll()}finally{buttons.forEach(x=>x.disabled=false)}});
+    visionButtons.forEach(b=>b.onclick=async()=>{visionSwitchBusy=true;visionButtons.forEach(x=>x.disabled=true);try{const r=await fetch('/api/vision-mode?enabled='+b.dataset.vision,{cache:'no-store'});if(!r.ok)throw new Error('vision mode')}catch(e){state.textContent='Mode change failed'}finally{visionSwitchBusy=false;await poll()}});
     mirror.onclick=()=>{mirrored=!mirrored;stream.classList.toggle('mirrored',mirrored);mirror.classList.toggle('active',mirrored);mirror.setAttribute('aria-pressed',String(mirrored));poll()};
     addEventListener('resize',poll);connectStream();poll();setInterval(poll,1250);
   </script>
@@ -317,6 +321,29 @@ void sendResponse(DriverClient& client, int code, const char* reason,
     Serial.println(sent ? 1 : 0);
 }
 
+void sendQrFrame(DriverClient& client)
+{
+    const uint8_t* jpeg = nullptr;
+    size_t length = 0;
+    if (!OnDeviceVision::lockQrJpeg(jpeg, length)) {
+        sendResponse(client, 503, "Service Unavailable", "text/plain",
+                     "QR frame unavailable");
+        return;
+    }
+
+    char header[240];
+    snprintf(header, sizeof(header),
+             "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: %lu\r\n"
+             "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+             static_cast<unsigned long>(length));
+    const bool sent = writeText(client, header) && writeAll(client, jpeg, length);
+    OnDeviceVision::unlockQrJpeg();
+    Serial.print("QR input frame bytes=");
+    Serial.print(length);
+    Serial.print(" sent=");
+    Serial.println(sent ? 1 : 0);
+}
+
 void sendStatus(DriverClient& client)
 {
     const int profileId = activeProfile;
@@ -332,7 +359,7 @@ void sendStatus(DriverClient& client)
              "\"stream_rejects\":%lu,\"stream_stalls\":%lu,"
              "\"max_capture_ms\":%lu,\"max_send_ms\":%lu,\"max_gap_ms\":%lu,"
              "\"vision_enabled\":%s,\"vision_ready\":%s,\"qr_self_test\":%s,"
-             "\"vision_frames\":%lu,"
+             "\"quirc_ready\":%s,\"quirc_self_test\":%s,\"vision_frames\":%lu,"
              "\"fc_enabled\":%s,\"fc_connected\":%s,\"fc_requests\":%lu,"
              "\"fc_responses\":%lu,\"fc_crc_errors\":%lu}",
              BW21CAM_VERSION, BW21CAM_BUILD_VARIANT, profileId, profile.name,
@@ -351,6 +378,8 @@ void sendStatus(DriverClient& client)
              vision.enabled ? "true" : "false",
              vision.ready ? "true" : "false",
              vision.qrSelfTestPassed ? "true" : "false",
+             vision.quircReady ? "true" : "false",
+             vision.quircSelfTestPassed ? "true" : "false",
              static_cast<unsigned long>(vision.analyzedFrames),
              BW21CAM_ENABLE_FC_LINK ? "true" : "false",
              FcLink::connected() ? "true" : "false",
@@ -392,8 +421,10 @@ void sendVision(DriverClient& client)
     const uint32_t now = millis();
     const uint32_t qrAge = vision.qrSeenAtMs ? now - vision.qrSeenAtMs : 0;
     const uint32_t objectAge = vision.objectSeenAtMs ? now - vision.objectSeenAtMs : 0;
-    const bool qrFresh = vision.qrSeenAtMs && qrAge <= BW21CAM_QR_STALE_MS;
-    const bool objectsFresh = vision.objectSeenAtMs && objectAge <= BW21CAM_OBJECT_STALE_MS;
+    const bool qrFresh = vision.enabled && vision.qrSeenAtMs &&
+                         qrAge <= BW21CAM_QR_STALE_MS;
+    const bool objectsFresh = vision.enabled && vision.objectSeenAtMs &&
+                              objectAge <= BW21CAM_OBJECT_STALE_MS;
     const uint32_t qrAccountedFrames = vision.qrCheckedFrames + vision.jpegDecodeErrors;
     const uint32_t qrBypassedFrames = vision.analyzedFrames > qrAccountedFrames
                                          ? vision.analyzedFrames - qrAccountedFrames
@@ -405,8 +436,14 @@ void sendVision(DriverClient& client)
         "{\"profile\":%d,\"fps\":%u,\"quality\":%u,\"stream_frames\":%lu,"
         "\"enabled\":%s,\"ready\":%s,\"frame_sequence\":%lu,\"frames\":%lu,"
         "\"jpeg_errors\":%lu,\"process_ms\":%lu,\"max_process_ms\":%lu,"
-        "\"qr_self_test\":%s,\"qr_luma\":[%u,%u,%u],\"qr_last_detail\":%d,"
+        "\"jpeg_decode_ms\":%lu,\"qr_scan_ms\":%lu,"
+        "\"qr_self_test\":%s,\"quirc_ready\":%s,\"quirc_self_test\":%s,"
+        "\"quirc_fast_self_test\":%s,\"quirc_full_self_test\":%s,"
+        "\"zbar_self_test\":%s,\"qr_luma\":[%u,%u,%u],\"qr_last_detail\":%d,"
         "\"qr_checked_frames\":%lu,\"qr_scan_passes\":%lu,"
+        "\"quirc_scans\":%lu,\"quirc_fast_scans\":%lu,\"quirc_full_scans\":%lu,"
+        "\"quirc_candidates\":%lu,"
+        "\"quirc_errors\":%lu,\"quirc_mirrored\":%lu,\"zbar_fallbacks\":%lu,"
         "\"qr_enhanced_scans\":%lu,\"qr_bypassed_frames\":%lu,"
         "\"qr\":{\"fresh\":%s,\"age_ms\":%lu,\"sequence\":%lu,\"payload\":",
         activeProfile, PROFILES[activeProfile].fps, PROFILES[activeProfile].jpegQuality,
@@ -417,11 +454,25 @@ void sendVision(DriverClient& client)
         static_cast<unsigned long>(vision.jpegDecodeErrors),
         static_cast<unsigned long>(vision.lastProcessMs),
         static_cast<unsigned long>(vision.maxProcessMs),
+        static_cast<unsigned long>(vision.lastJpegDecodeMs),
+        static_cast<unsigned long>(vision.lastQrScanMs),
         vision.qrSelfTestPassed ? "true" : "false",
+        vision.quircReady ? "true" : "false",
+        vision.quircSelfTestPassed ? "true" : "false",
+        vision.quircFastSelfTestPassed ? "true" : "false",
+        vision.quircFullSelfTestPassed ? "true" : "false",
+        vision.zbarSelfTestPassed ? "true" : "false",
         vision.qrDarkest, vision.qrMean, vision.qrBrightest,
         static_cast<int>(vision.qrLastScanDetail),
         static_cast<unsigned long>(vision.qrCheckedFrames),
         static_cast<unsigned long>(vision.qrScanPasses),
+        static_cast<unsigned long>(vision.quircScanPasses),
+        static_cast<unsigned long>(vision.quircFastScans),
+        static_cast<unsigned long>(vision.quircFullScans),
+        static_cast<unsigned long>(vision.quircCandidates),
+        static_cast<unsigned long>(vision.quircDecodeErrors),
+        static_cast<unsigned long>(vision.quircMirroredDecodes),
+        static_cast<unsigned long>(vision.zbarFallbackScans),
         static_cast<unsigned long>(vision.qrEnhancedScans),
         static_cast<unsigned long>(qrBypassedFrames),
         qrFresh ? "true" : "false",
@@ -470,6 +521,22 @@ void handleControlClient(DriverClient& client)
         sendStatus(client);
     } else if (requestTargets(request, "/api/vision")) {
         sendVision(client);
+    } else if (requestTargets(request, "/api/qr-frame.jpg")) {
+        sendQrFrame(client);
+    } else if (requestTargets(request, "/api/vision-mode")) {
+        const char* enabled = strstr(request, "?enabled=");
+        const bool valid = enabled && (enabled[9] == '0' || enabled[9] == '1') &&
+                           (enabled[10] == ' ' || enabled[10] == '&');
+        if (!valid) {
+            sendResponse(client, 400, "Bad Request", "application/json",
+                         "{\"accepted\":false}");
+        } else if (!OnDeviceVision::setEnabled(enabled[9] == '1')) {
+            sendResponse(client, 503, "Service Unavailable", "application/json",
+                         "{\"accepted\":false,\"reason\":\"vision_unavailable\"}");
+        } else {
+            sendResponse(client, 200, "OK", "application/json",
+                         "{\"accepted\":true}");
+        }
     } else if (requestTargets(request, "/api/profile")) {
         const char* id = strstr(request, "?id=");
         char* end = nullptr;
@@ -753,6 +820,8 @@ void printPeriodicStatus()
     const uint32_t qrBypassedFrames = vision.analyzedFrames > qrAccountedFrames
                                          ? vision.analyzedFrames - qrAccountedFrames
                                          : 0;
+    Serial.print(" vision=");
+    Serial.print(vision.enabled ? "ON" : "OFF");
     Serial.print(" vision_frames=");
     Serial.print(vision.analyzedFrames);
     Serial.print(" qr_checked=");
@@ -761,10 +830,36 @@ void printPeriodicStatus()
     Serial.print(qrBypassedFrames);
     Serial.print(" vision_ms=");
     Serial.print(vision.lastProcessMs);
+    Serial.print(" jpeg_ms=");
+    Serial.print(vision.lastJpegDecodeMs);
+    Serial.print(" qr_ms=");
+    Serial.print(vision.lastQrScanMs);
     Serial.print(" qr_decodes=");
     Serial.print(vision.qrDecodes);
+    Serial.print(" quirc=");
+    Serial.print(vision.quircScanPasses);
+    Serial.print(" fast=");
+    Serial.print(vision.quircFastScans);
+    Serial.print(" full=");
+    Serial.print(vision.quircFullScans);
+    Serial.print('/');
+    Serial.print(vision.quircCandidates);
+    Serial.print('/');
+    Serial.print(vision.quircDecodeErrors);
+    Serial.print(" mirrored=");
+    Serial.print(vision.quircMirroredDecodes);
+    Serial.print(" zbar_fb=");
+    Serial.print(vision.zbarFallbackScans);
     Serial.print(" qr_self_test=");
     Serial.print(vision.qrSelfTestPassed ? "PASS" : "FAIL");
+    Serial.print(" quirc_self=");
+    Serial.print(vision.quircSelfTestPassed ? "PASS" : "FAIL");
+    Serial.print(" fast_self=");
+    Serial.print(vision.quircFastSelfTestPassed ? "PASS" : "FAIL");
+    Serial.print(" full_self=");
+    Serial.print(vision.quircFullSelfTestPassed ? "PASS" : "FAIL");
+    Serial.print(" zbar_self=");
+    Serial.print(vision.zbarSelfTestPassed ? "PASS" : "FAIL");
     Serial.print(" qr_detail=");
     Serial.print(static_cast<int>(vision.qrLastScanDetail));
     Serial.print(" qr_luma=");

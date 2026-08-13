@@ -25,6 +25,11 @@ struct Status {
     bool enabled;
     bool ready;
     bool qrSelfTestPassed;
+    bool quircReady;
+    bool quircSelfTestPassed;
+    bool quircFastSelfTestPassed;
+    bool quircFullSelfTestPassed;
+    bool zbarSelfTestPassed;
     uint32_t frameSequence;
     uint32_t analyzedFrames;
     uint32_t qrCheckedFrames;
@@ -36,10 +41,19 @@ struct Status {
     uint32_t qrDecodes;
     uint32_t qrDecodeErrors;
     uint32_t qrDuplicates;
+    uint32_t quircScanPasses;
+    uint32_t quircFastScans;
+    uint32_t quircFullScans;
+    uint32_t quircCandidates;
+    uint32_t quircDecodeErrors;
+    uint32_t quircMirroredDecodes;
+    uint32_t zbarFallbackScans;
     uint32_t qrSequence;
     uint32_t qrSeenAtMs;
     uint32_t lastProcessMs;
     uint32_t maxProcessMs;
+    uint32_t lastJpegDecodeMs;
+    uint32_t lastQrScanMs;
     int8_t qrLastScanDetail;
     uint8_t qrDarkest;
     uint8_t qrMean;
@@ -54,6 +68,9 @@ struct Status {
 
 void configureCamera();
 bool begin();
+bool setEnabled(bool enabled);
 void getStatus(Status& status);
+bool lockQrJpeg(const uint8_t*& jpeg, size_t& length);
+void unlockQrJpeg();
 
 }  // namespace OnDeviceVision

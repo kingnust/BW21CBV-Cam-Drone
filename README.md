@@ -2,10 +2,11 @@
 
 Firmware for the Ai-Thinker BW21-CBV-Kit camera used on the indoor drone.
 
-The first firmware is a camera and Wi-Fi test build. It creates a local access
-point, serves a browser-based MJPEG viewer, and provides three simple frame-rate
-and JPEG-quality presets. The optional flight-controller link is compiled out
-by default so camera testing cannot disturb the FC.
+The default firmware creates a local access point, serves a browser-based MJPEG
+viewer, and provides three simple frame-rate and JPEG-quality presets. It also
+contains onboard vision that can be turned on and off at runtime. The optional
+flight-controller link is compiled out by default so camera testing cannot
+disturb the FC.
 
 ## PlatformIO workflow
 
@@ -66,12 +67,18 @@ platformio run -e bw21-cam-vision
 platformio run -e bw21-cam-vision -t upload
 ```
 
-The vision build continuously analyzes the exact captured JPEG frames, even
-when no browser is connected. A dedicated 640 x 480 camera channel scans every
-analysis frame for QR codes and calculates per-object color without blocking
-the live stream, while the Realtek NN engine runs YOLOv4-tiny on a separate
-576 x 320, 10 FPS camera channel. Results and stale
-state are available in the web page, `/api/status`, and `/api/vision`.
+The vision build starts in low-load `Camera` mode. The web-page `Camera` /
+`Vision` control can start or stop QR scanning and object detection without a
+reboot; disabling vision pauses the NN pipeline and stops both analysis camera
+channels so the live stream receives the available processing time. When
+enabled, a dedicated 640 x 480 camera channel feeds a fast QVGA QR search on
+every analysis frame. Timed full-resolution retries preserve
+small-code range, and contrast/ZBar fallbacks run only after the clean quirc
+passes fail. This leaves the 1280 x 720 live stream cadence independent of QR
+latency. The same analysis channel calculates per-object color, while the
+Realtek NN engine runs YOLOv4-tiny on a separate 576 x 320, 10 FPS channel.
+Results, fast/full scan counters, and stage timings are available in the web
+page, `/api/status`, and `/api/vision`.
 
 Use `bw21-cam-vision-wk2132` to add the FC link. A newly decoded QR payload is
 then sent through the existing acknowledged MSP2 QR transport. Ordinary camera

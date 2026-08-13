@@ -13,6 +13,8 @@
 #include <QRCodeScanner_Libraries/zbar/zbar.h>
 #include <semphr.h>
 
+#include "quirc.h"
+
 #include <algorithm>
 #include <vector>
 
@@ -28,9 +30,15 @@ constexpr uint8_t NN_FPS = 10;
 constexpr uint8_t QR_CHANNEL = 1;
 constexpr uint16_t QR_WIDTH = 640;
 constexpr uint16_t QR_HEIGHT = 480;
+constexpr uint16_t QR_FAST_WIDTH = QR_WIDTH / 2;
+constexpr uint16_t QR_FAST_HEIGHT = QR_HEIGHT / 2;
 constexpr uint8_t QR_FPS = 10;
-constexpr uint8_t QR_JPEG_QUALITY = 5;
+constexpr uint8_t QR_JPEG_QUALITY = 9;
 constexpr size_t QR_PIXELS = static_cast<size_t>(QR_WIDTH) * QR_HEIGHT;
+constexpr size_t QR_FAST_PIXELS = static_cast<size_t>(QR_FAST_WIDTH) * QR_FAST_HEIGHT;
+constexpr uint32_t QR_FULL_RETRY_MS = 250;
+constexpr uint32_t ZBAR_FALLBACK_MS = 1500;
+constexpr uint32_t COLOR_SAMPLE_MS = 250;
 constexpr uint32_t QR_REAPPEAR_MS = 1800;
 constexpr uint32_t OBJECT_HOLD_MS = 700;
 constexpr float OBJECT_BOX_NEW_WEIGHT = 0.45f;
@@ -62,6 +70,9 @@ struct ColorAccumulator {
 };
 
 struct DecodeContext {
+    uint8_t* luma;
+    uint16_t width;
+    uint16_t height;
     ObjectResult objects[BW21CAM_VISION_MAX_OBJECTS];
     ColorAccumulator objectColors[BW21CAM_VISION_MAX_OBJECTS];
     uint8_t objectCount;
@@ -78,11 +89,21 @@ NNObjectDetection objectDetector;
 StreamIO nnStreamer(1, 1);
 JPEGDEC jpegDecoder;
 SemaphoreHandle_t stateMutex = nullptr;
+SemaphoreHandle_t analysisMutex = nullptr;
+volatile bool visionActive = false;
 Status state = {};
 DecodeContext decodeContext = {};
 uint8_t qrLuma[QR_PIXELS] = {};
+uint8_t qrFastLuma[QR_FAST_PIXELS] = {};
 zbar_image_scanner_t* qrScanner = nullptr;
 zbar_image_t* qrImage = nullptr;
+struct quirc* quircFullDecoder = nullptr;
+struct quirc* quircFastDecoder = nullptr;
+struct quirc_code quircCode = {};
+struct quirc_data quircData = {};
+uint32_t lastFullScanAtMs = 0;
+uint32_t lastZbarScanAtMs = 0;
+uint32_t lastColorSampleAtMs = 0;
 
 constexpr char QR_SELF_TEST_PAYLOAD[] = "BW21-QR-EVERY-FRAME-2026";
 constexpr char QR_SELF_TEST_MODULES[] =
@@ -230,17 +251,19 @@ void finishColor(const ColorAccumulator& accumulator, char* name,
 
 int drawJpegBlock(JPEGDRAW* draw)
 {
+    if (!decodeContext.luma || !decodeContext.width || !decodeContext.height) return 0;
     const int width = draw->iWidthUsed > 0 ? draw->iWidthUsed : draw->iWidth;
     if (draw->iBpp == 8) {
         const uint8_t* pixels = reinterpret_cast<const uint8_t*>(draw->pPixels);
         for (int row = 0; row < draw->iHeight; row++) {
             const int y = draw->y + row;
-            if (y < 0 || y >= QR_HEIGHT) continue;
+            if (y < 0 || y >= decodeContext.height) continue;
             for (int column = 0; column < width; column++) {
                 const int x = draw->x + column;
-                if (x < 0 || x >= QR_WIDTH) continue;
+                if (x < 0 || x >= decodeContext.width) continue;
                 const uint8_t luminance = pixels[row * draw->iWidth + column];
-                qrLuma[static_cast<size_t>(y) * QR_WIDTH + x] = luminance;
+                decodeContext.luma[static_cast<size_t>(y) * decodeContext.width + x] =
+                    luminance;
                 decodeContext.histogram[luminance]++;
                 decodeContext.decodedPixels++;
                 decodeContext.luminanceSum += luminance;
@@ -253,10 +276,10 @@ int drawJpegBlock(JPEGDRAW* draw)
 
     for (int row = 0; row < draw->iHeight; row++) {
         const int y = draw->y + row;
-        if (y < 0 || y >= QR_HEIGHT) continue;
+        if (y < 0 || y >= decodeContext.height) continue;
         for (int column = 0; column < width; column++) {
             const int x = draw->x + column;
-            if (x < 0 || x >= QR_WIDTH) continue;
+            if (x < 0 || x >= decodeContext.width) continue;
 
             const uint16_t pixel = draw->pPixels[row * draw->iWidth + column];
             const uint8_t red = static_cast<uint8_t>(((pixel >> 11) & 0x1f) * 255U / 31U);
@@ -264,7 +287,8 @@ int drawJpegBlock(JPEGDRAW* draw)
             const uint8_t blue = static_cast<uint8_t>((pixel & 0x1f) * 255U / 31U);
             const uint8_t luminance = static_cast<uint8_t>(
                 (77U * red + 150U * green + 29U * blue) >> 8);
-            qrLuma[static_cast<size_t>(y) * QR_WIDTH + x] = luminance;
+            decodeContext.luma[static_cast<size_t>(y) * decodeContext.width + x] =
+                luminance;
             decodeContext.histogram[luminance]++;
             decodeContext.decodedPixels++;
             decodeContext.luminanceSum += luminance;
@@ -277,8 +301,8 @@ int drawJpegBlock(JPEGDRAW* draw)
                 const ObjectResult& object = decodeContext.objects[i];
                 const float marginX = (object.xMax - object.xMin) * 0.12f;
                 const float marginY = (object.yMax - object.yMin) * 0.12f;
-                const float normalizedX = static_cast<float>(x) / QR_WIDTH;
-                const float normalizedY = static_cast<float>(y) / QR_HEIGHT;
+                const float normalizedX = static_cast<float>(x) / decodeContext.width;
+                const float normalizedY = static_cast<float>(y) / decodeContext.height;
                 if (normalizedX >= object.xMin + marginX && normalizedX <= object.xMax - marginX &&
                     normalizedY >= object.yMin + marginY && normalizedY <= object.yMax - marginY) {
                     addColor(decodeContext.objectColors[i], color);
@@ -289,79 +313,144 @@ int drawJpegBlock(JPEGDRAW* draw)
     return 1;
 }
 
-void stretchContrast()
+bool stretchContrast(uint8_t* luma, size_t pixels)
 {
-    const uint32_t lowerTarget = QR_PIXELS / 50;
-    const uint32_t upperTarget = QR_PIXELS - lowerTarget;
+    if (!luma || !pixels) return false;
+    const uint32_t tail = std::max<uint32_t>(1, pixels / 100U);
     uint32_t cumulative = 0;
-    uint8_t lower = decodeContext.darkest;
-    uint8_t upper = decodeContext.brightest;
+    uint8_t darkest = decodeContext.darkest;
+    uint8_t brightest = decodeContext.brightest;
     for (uint16_t value = 0; value < 256; value++) {
         cumulative += decodeContext.histogram[value];
-        if (cumulative >= lowerTarget) {
-            lower = static_cast<uint8_t>(value);
+        if (cumulative >= tail) {
+            darkest = static_cast<uint8_t>(value);
             break;
         }
     }
     cumulative = 0;
-    for (uint16_t value = 0; value < 256; value++) {
+    for (int value = 255; value >= 0; value--) {
         cumulative += decodeContext.histogram[value];
-        if (cumulative >= upperTarget) {
-            upper = static_cast<uint8_t>(value);
+        if (cumulative >= tail) {
+            brightest = static_cast<uint8_t>(value);
             break;
         }
     }
-    const uint16_t span = upper - lower;
-    if (span < 40 || span > 220) return;
-    for (size_t i = 0; i < QR_PIXELS; i++) {
-        const uint8_t value = qrLuma[i];
-        if (value <= lower) qrLuma[i] = 0;
-        else if (value >= upper) qrLuma[i] = 255;
-        else qrLuma[i] = static_cast<uint8_t>(
-            (static_cast<uint16_t>(value - lower) * 255U) / span);
+    const uint16_t span = brightest - darkest;
+    if (span < 32 || span >= 220) return false;
+    for (size_t i = 0; i < pixels; i++) {
+        const uint8_t value = luma[i];
+        if (value <= darkest) luma[i] = 0;
+        else if (value >= brightest) luma[i] = 255;
+        else luma[i] = static_cast<uint8_t>(
+            (static_cast<uint16_t>(value - darkest) * 255U) / span);
+    }
+    return true;
+}
+
+bool acceptQrPayloadLocked(const uint8_t* payload, size_t length, uint32_t now)
+{
+    if (!payload || length == 0 || length >= QR_PAYLOAD_CAPACITY ||
+        !isValidUtf8Text(reinterpret_cast<const char*>(payload), length)) {
+        state.qrDecodeErrors++;
+        return false;
+    }
+
+    const char* text = reinterpret_cast<const char*>(payload);
+    const bool changed = strncmp(state.qrPayload, text, length) != 0 ||
+                         state.qrPayload[length] != 0;
+    const bool reappeared = state.qrSeenAtMs && now - state.qrSeenAtMs > QR_REAPPEAR_MS;
+    state.qrSeenAtMs = now;
+    state.qrDecodes++;
+    if (changed || reappeared || state.qrSequence == 0) {
+        memcpy(state.qrPayload, payload, length);
+        state.qrPayload[length] = 0;
+        state.qrSequence++;
+    } else {
+        state.qrDuplicates++;
+    }
+    return true;
+}
+
+void transposeQrCode(struct quirc_code& code)
+{
+    for (int y = 0; y < code.size; y++) {
+        for (int x = 0; x < y; x++) {
+            const int first = y * code.size + x;
+            const int second = x * code.size + y;
+            const bool firstSet = code.cell_bitmap[first >> 3] & (1U << (first & 7));
+            const bool secondSet = code.cell_bitmap[second >> 3] & (1U << (second & 7));
+            if (firstSet != secondSet) {
+                code.cell_bitmap[first >> 3] ^= 1U << (first & 7);
+                code.cell_bitmap[second >> 3] ^= 1U << (second & 7);
+            }
+        }
     }
 }
 
-bool recordQrResult(uint32_t now, int& scanDetail)
+bool scanWithQuirc(struct quirc* decoder, const uint8_t* luma, size_t pixels,
+                   bool fullResolution, uint32_t now, int* candidates = nullptr)
+{
+    uint8_t* image = quirc_begin(decoder, nullptr, nullptr);
+    if (!image || !luma) return false;
+    memcpy(image, luma, pixels);
+    quirc_end(decoder);
+
+    const int count = quirc_count(decoder);
+    if (candidates) *candidates = count;
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    state.qrScanPasses++;
+    state.quircScanPasses++;
+    if (fullResolution) state.quircFullScans++;
+    else state.quircFastScans++;
+    state.quircCandidates += count;
+    state.qrCandidates += count;
+    state.qrLastScanDetail = static_cast<int8_t>(std::min(count, 127));
+    if (count == 0) state.qrNoFinderCenters++;
+    xSemaphoreGive(stateMutex);
+
+    for (int index = 0; index < count; index++) {
+        quirc_extract(decoder, index, &quircCode);
+        quirc_decode_error_t error = quirc_decode(&quircCode, &quircData);
+        bool mirrored = false;
+        if (error != QUIRC_SUCCESS) {
+            transposeQrCode(quircCode);
+            error = quirc_decode(&quircCode, &quircData);
+            mirrored = error == QUIRC_SUCCESS;
+        }
+
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
+        if (error == QUIRC_SUCCESS) {
+            if (mirrored) state.quircMirroredDecodes++;
+            const bool accepted = acceptQrPayloadLocked(
+                quircData.payload, quircData.payload_len, now);
+            if (!accepted) state.quircDecodeErrors++;
+            xSemaphoreGive(stateMutex);
+            if (accepted) return true;
+        } else {
+            state.quircDecodeErrors++;
+            state.qrDecodeErrors++;
+            xSemaphoreGive(stateMutex);
+        }
+    }
+    return false;
+}
+
+bool scanWithZbar(uint32_t now, int& scanDetail)
 {
     scanDetail = 0;
-    const int decoded = zbar_scan_image(qrScanner, qrImage, &scanDetail);
+    zbar_scan_image(qrScanner, qrImage, &scanDetail);
     const zbar_symbol_t* symbol = zbar_image_first_symbol(qrImage);
     bool accepted = false;
 
     xSemaphoreTake(stateMutex, portMAX_DELAY);
-    state.qrScanPasses++;
-    state.qrLastScanDetail = static_cast<int8_t>(scanDetail);
-    if (scanDetail == -1) state.qrNoFinderCenters++;
-    if (scanDetail == -2) {
-        state.qrCandidates++;
-        state.qrDecodeErrors++;
-    }
-    if (decoded > 0) state.qrCandidates += decoded;
+    state.zbarFallbackScans++;
     for (; symbol; symbol = zbar_symbol_next(symbol)) {
         if (zbar_symbol_get_type(symbol) != ZBAR_QRCODE) continue;
-        const char* payload = zbar_symbol_get_data(symbol);
+        const uint8_t* payload = reinterpret_cast<const uint8_t*>(
+            zbar_symbol_get_data(symbol));
         const size_t sourceLength = zbar_symbol_get_data_length(symbol);
-        const size_t length = std::min(sourceLength, QR_PAYLOAD_CAPACITY - 1);
-        if (!isValidUtf8Text(payload, length)) {
-            state.qrDecodeErrors++;
-            continue;
-        }
-
-        const bool changed = strncmp(state.qrPayload, payload, length) != 0 ||
-                             state.qrPayload[length] != 0;
-        const bool reappeared = state.qrSeenAtMs && now - state.qrSeenAtMs > QR_REAPPEAR_MS;
-        state.qrSeenAtMs = now;
-        state.qrDecodes++;
-        if (changed || reappeared || state.qrSequence == 0) {
-            memcpy(state.qrPayload, payload, length);
-            state.qrPayload[length] = 0;
-            state.qrSequence++;
-        } else {
-            state.qrDuplicates++;
-        }
-        accepted = true;
-        break;
+        accepted = acceptQrPayloadLocked(payload, sourceLength, now);
+        if (accepted) break;
     }
     xSemaphoreGive(stateMutex);
     return accepted;
@@ -375,25 +464,52 @@ bool setQrDensity(int density)
                qrScanner, ZBAR_NONE, ZBAR_CFG_Y_DENSITY, density) == 0;
 }
 
-bool runQrSelfTest()
+void renderQrSelfTest(uint8_t* luma, uint16_t width, uint16_t height,
+                      uint8_t moduleSize)
 {
-    memset(qrLuma, 255, sizeof(qrLuma));
+    memset(luma, 255, static_cast<size_t>(width) * height);
     constexpr int moduleCount = 25;
-    constexpr int moduleSize = 10;
-    constexpr int renderedSize = moduleCount * moduleSize;
-    constexpr int left = (QR_WIDTH - renderedSize) / 2;
-    constexpr int top = (QR_HEIGHT - renderedSize) / 2;
+    const int renderedSize = moduleCount * moduleSize;
+    const int left = (width - renderedSize) / 2;
+    const int top = (height - renderedSize) / 2;
     for (int moduleY = 0; moduleY < moduleCount; moduleY++) {
         for (int moduleX = 0; moduleX < moduleCount; moduleX++) {
             if (QR_SELF_TEST_MODULES[moduleY * moduleCount + moduleX] != '1') continue;
             for (int y = 0; y < moduleSize; y++) {
-                memset(qrLuma + static_cast<size_t>(top + moduleY * moduleSize + y) *
-                                    QR_WIDTH + left + moduleX * moduleSize,
+                memset(luma + static_cast<size_t>(top + moduleY * moduleSize + y) *
+                                  width + left + moduleX * moduleSize,
                        0, moduleSize);
             }
         }
     }
+}
 
+bool runQuircSelfTest(struct quirc* decoder, uint8_t* luma, size_t pixels)
+{
+    uint8_t* image = quirc_begin(decoder, nullptr, nullptr);
+    if (!image) return false;
+    memcpy(image, luma, pixels);
+    quirc_end(decoder);
+    const int count = quirc_count(decoder);
+    for (int index = 0; index < count; index++) {
+        quirc_extract(decoder, index, &quircCode);
+        quirc_decode_error_t error = quirc_decode(&quircCode, &quircData);
+        if (error != QUIRC_SUCCESS) {
+            transposeQrCode(quircCode);
+            error = quirc_decode(&quircCode, &quircData);
+        }
+        if (error == QUIRC_SUCCESS &&
+            quircData.payload_len == strlen(QR_SELF_TEST_PAYLOAD) &&
+            memcmp(quircData.payload, QR_SELF_TEST_PAYLOAD,
+                   quircData.payload_len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool runZbarSelfTest()
+{
     for (int density : {2, 1}) {
         if (!setQrDensity(density)) return false;
         int scanDetail = 0;
@@ -404,12 +520,10 @@ bool runQrSelfTest()
             const size_t length = zbar_symbol_get_data_length(symbol);
             if (length == strlen(QR_SELF_TEST_PAYLOAD) &&
                 memcmp(zbar_symbol_get_data(symbol), QR_SELF_TEST_PAYLOAD, length) == 0) {
-                memset(qrLuma, 255, sizeof(qrLuma));
                 return true;
             }
         }
     }
-    memset(qrLuma, 255, sizeof(qrLuma));
     return false;
 }
 
@@ -486,6 +600,8 @@ void applyObjectColors()
 
 void objectResultCallback(std::vector<ObjectDetectionResult> results)
 {
+    if (!visionActive) return;
+
     ObjectResult objects[BW21CAM_VISION_MAX_OBJECTS] = {};
     uint8_t count = 0;
     for (size_t i = 0; i < results.size() && count < BW21CAM_VISION_MAX_OBJECTS; i++) {
@@ -502,6 +618,10 @@ void objectResultCallback(std::vector<ObjectDetectionResult> results)
 
     const uint32_t now = millis();
     xSemaphoreTake(stateMutex, portMAX_DELAY);
+    if (!visionActive) {
+        xSemaphoreGive(stateMutex);
+        return;
+    }
     state.yoloFrames++;
     if (count) {
         retainObjectHistory(objects, count);
@@ -518,20 +638,28 @@ void objectResultCallback(std::vector<ObjectDetectionResult> results)
     xSemaphoreGive(stateMutex);
 }
 
-void processAnalysisJpeg(const uint8_t* jpeg, size_t length, uint32_t frameSequence)
+bool decodeAnalysisJpeg(const uint8_t* jpeg, size_t length, bool fullResolution,
+                        bool sampleObjectColors)
 {
-    if (!state.ready || !jpeg || !length) return;
-    const uint32_t started = millis();
-    memset(qrLuma, 255, sizeof(qrLuma));
+    uint8_t* luma = fullResolution ? qrLuma : qrFastLuma;
+    const uint16_t width = fullResolution ? QR_WIDTH : QR_FAST_WIDTH;
+    const uint16_t height = fullResolution ? QR_HEIGHT : QR_FAST_HEIGHT;
+    const size_t pixels = static_cast<size_t>(width) * height;
+
+    memset(luma, 255, pixels);
     memset(&decodeContext, 0, sizeof(decodeContext));
+    decodeContext.luma = luma;
+    decodeContext.width = width;
+    decodeContext.height = height;
     decodeContext.darkest = 255;
 
-    xSemaphoreTake(stateMutex, portMAX_DELAY);
-    decodeContext.objectCount = state.objectCount;
-    memcpy(decodeContext.objects, state.objects, sizeof(state.objects));
-    xSemaphoreGive(stateMutex);
+    if (sampleObjectColors) {
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
+        decodeContext.objectCount = state.objectCount;
+        memcpy(decodeContext.objects, state.objects, sizeof(state.objects));
+        xSemaphoreGive(stateMutex);
+    }
 
-    const bool sampleObjectColors = decodeContext.objectCount > 0;
     bool decodeOk = jpegDecoder.openFLASH(const_cast<uint8_t*>(jpeg), length,
                                           drawJpegBlock) != 0;
     if (decodeOk) {
@@ -539,36 +667,108 @@ void processAnalysisJpeg(const uint8_t* jpeg, size_t length, uint32_t frameSeque
                                                     : EIGHT_BIT_GRAYSCALE);
         decodeOk = jpegDecoder.getWidth() == QR_WIDTH &&
                    jpegDecoder.getHeight() == QR_HEIGHT &&
-                   jpegDecoder.decode(0, 0, 0) != 0;
+                   jpegDecoder.decode(0, 0,
+                                      fullResolution ? 0 : JPEG_SCALE_HALF) != 0;
         jpegDecoder.close();
     }
+    return decodeOk && decodeContext.decodedPixels == pixels;
+}
 
-    if (decodeOk) {
-        int scanDetail = 0;
-        setQrDensity((frameSequence & 1U) ? 1 : 2);
-        const bool decoded = recordQrResult(millis(), scanDetail);
-        if (!decoded && scanDetail == -2) {
-            stretchContrast();
-            setQrDensity(1);
+void processAnalysisJpeg(const uint8_t* jpeg, size_t length, uint32_t frameSequence)
+{
+    if (!visionActive || !state.ready || !jpeg || !length) return;
+    const uint32_t started = millis();
+    uint32_t jpegDecodeMs = 0;
+    uint32_t qrScanMs = 0;
+    bool accepted = false;
+    bool decodedAny = false;
+    uint8_t darkest = 255;
+    uint8_t brightest = 0;
+    uint8_t mean = 0;
+
+    uint32_t stageStarted = millis();
+    const bool fastDecodeOk = decodeAnalysisJpeg(jpeg, length, false, false);
+    jpegDecodeMs += millis() - stageStarted;
+    decodedAny = fastDecodeOk;
+    if (fastDecodeOk) {
+        darkest = decodeContext.darkest;
+        brightest = decodeContext.brightest;
+        mean = static_cast<uint8_t>(decodeContext.luminanceSum /
+                                    decodeContext.decodedPixels);
+        int candidates = 0;
+        stageStarted = millis();
+        accepted = scanWithQuirc(quircFastDecoder, qrFastLuma, QR_FAST_PIXELS,
+                                 false, millis(), &candidates);
+        if (!accepted && stretchContrast(qrFastLuma, QR_FAST_PIXELS)) {
             xSemaphoreTake(stateMutex, portMAX_DELAY);
             state.qrEnhancedScans++;
             xSemaphoreGive(stateMutex);
-            recordQrResult(millis(), scanDetail);
+            accepted = scanWithQuirc(quircFastDecoder, qrFastLuma, QR_FAST_PIXELS,
+                                     false, millis());
+        }
+        qrScanMs += millis() - stageStarted;
+    }
+
+    const uint32_t now = millis();
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    const bool haveObjects = state.objectCount > 0;
+    xSemaphoreGive(stateMutex);
+    const bool fullScanDue = !accepted && now - lastFullScanAtMs >= QR_FULL_RETRY_MS;
+    const bool colorSampleDue = haveObjects && now - lastColorSampleAtMs >= COLOR_SAMPLE_MS;
+    if (fullScanDue || colorSampleDue) {
+        stageStarted = millis();
+        const bool fullDecodeOk = decodeAnalysisJpeg(jpeg, length, true, haveObjects);
+        jpegDecodeMs += millis() - stageStarted;
+        decodedAny = decodedAny || fullDecodeOk;
+        if (fullDecodeOk) {
+            darkest = decodeContext.darkest;
+            brightest = decodeContext.brightest;
+            mean = static_cast<uint8_t>(decodeContext.luminanceSum /
+                                        decodeContext.decodedPixels);
+            if (haveObjects) {
+                xSemaphoreTake(stateMutex, portMAX_DELAY);
+                applyObjectColors();
+                xSemaphoreGive(stateMutex);
+                lastColorSampleAtMs = now;
+            }
+            if (fullScanDue) {
+                lastFullScanAtMs = now;
+                int fullCandidates = 0;
+                stageStarted = millis();
+                accepted = scanWithQuirc(quircFullDecoder, qrLuma, QR_PIXELS,
+                                         true, millis(), &fullCandidates);
+                const bool zbarDue = now - lastZbarScanAtMs >= ZBAR_FALLBACK_MS;
+                if (!accepted && (fullCandidates > 0 || zbarDue) &&
+                    stretchContrast(qrLuma, QR_PIXELS)) {
+                    xSemaphoreTake(stateMutex, portMAX_DELAY);
+                    state.qrEnhancedScans++;
+                    xSemaphoreGive(stateMutex);
+                    accepted = scanWithQuirc(quircFullDecoder, qrLuma, QR_PIXELS,
+                                             true, millis());
+                }
+                if (!accepted && zbarDue) {
+                    lastZbarScanAtMs = now;
+                    int scanDetail = 0;
+                    setQrDensity(1);
+                    accepted = scanWithZbar(millis(), scanDetail);
+                }
+                qrScanMs += millis() - stageStarted;
+            }
         }
     }
 
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     state.frameSequence = frameSequence;
     state.analyzedFrames++;
-    if (!decodeOk) state.jpegDecodeErrors++;
-    if (decodeOk) state.qrCheckedFrames++;
-    if (decodeOk && sampleObjectColors) applyObjectColors();
-    if (decodeOk && decodeContext.decodedPixels) {
-        state.qrDarkest = decodeContext.darkest;
-        state.qrBrightest = decodeContext.brightest;
-        state.qrMean = static_cast<uint8_t>(
-            decodeContext.luminanceSum / decodeContext.decodedPixels);
+    if (!fastDecodeOk) state.jpegDecodeErrors++;
+    if (fastDecodeOk) state.qrCheckedFrames++;
+    if (decodedAny) {
+        state.qrDarkest = darkest;
+        state.qrBrightest = brightest;
+        state.qrMean = mean;
     }
+    state.lastJpegDecodeMs = jpegDecodeMs;
+    state.lastQrScanMs = qrScanMs;
     state.lastProcessMs = millis() - started;
     state.maxProcessMs = std::max(state.maxProcessMs, state.lastProcessMs);
     xSemaphoreGive(stateMutex);
@@ -578,11 +778,21 @@ void analysisTask(void*)
 {
     uint32_t sequence = 0;
     for (;;) {
+        if (!visionActive) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        xSemaphoreTake(analysisMutex, portMAX_DELAY);
+        if (!visionActive) {
+            xSemaphoreGive(analysisMutex);
+            continue;
+        }
         uint32_t imageAddress = 0;
         uint32_t imageLength = 0;
         Camera.getImage(QR_CHANNEL, &imageAddress, &imageLength);
         processAnalysisJpeg(reinterpret_cast<const uint8_t*>(imageAddress),
                             imageLength, ++sequence);
+        xSemaphoreGive(analysisMutex);
         vTaskDelay(1);
     }
 }
@@ -599,8 +809,9 @@ void configureCamera()
 bool begin()
 {
     stateMutex = xSemaphoreCreateMutex();
-    if (!stateMutex) return false;
-    state.enabled = true;
+    analysisMutex = xSemaphoreCreateMutex();
+    if (!stateMutex || !analysisMutex) return false;
+    state.enabled = false;
 
     qrScanner = zbar_image_scanner_create(2, 2);
     qrImage = zbar_image_create();
@@ -614,8 +825,36 @@ bool begin()
     zbar_image_set_format(qrImage, format);
     zbar_image_set_size(qrImage, QR_WIDTH, QR_HEIGHT);
     zbar_image_set_data(qrImage, qrLuma, QR_PIXELS, nullptr);
-    state.qrSelfTestPassed = runQrSelfTest();
-    Serial.print("QR decoder self-test: ");
+    quircFullDecoder = quirc_new();
+    quircFastDecoder = quirc_new();
+    if (!quircFullDecoder || !quircFastDecoder ||
+        quirc_resize(quircFullDecoder, QR_WIDTH, QR_HEIGHT) < 0 ||
+        quirc_resize(quircFastDecoder, QR_FAST_WIDTH, QR_FAST_HEIGHT) < 0) {
+        Serial.println("quirc allocation failed");
+        return false;
+    }
+    state.quircReady = true;
+    renderQrSelfTest(qrLuma, QR_WIDTH, QR_HEIGHT, 10);
+    state.quircFullSelfTestPassed = runQuircSelfTest(
+        quircFullDecoder, qrLuma, QR_PIXELS);
+    renderQrSelfTest(qrFastLuma, QR_FAST_WIDTH, QR_FAST_HEIGHT, 5);
+    state.quircFastSelfTestPassed = runQuircSelfTest(
+        quircFastDecoder, qrFastLuma, QR_FAST_PIXELS);
+    state.quircSelfTestPassed = state.quircFastSelfTestPassed &&
+                                state.quircFullSelfTestPassed;
+    renderQrSelfTest(qrLuma, QR_WIDTH, QR_HEIGHT, 10);
+    state.zbarSelfTestPassed = runZbarSelfTest();
+    state.qrSelfTestPassed = state.quircSelfTestPassed && state.zbarSelfTestPassed;
+    memset(qrLuma, 255, sizeof(qrLuma));
+    Serial.print("QR decoder self-test: quirc=");
+    Serial.print(state.quircSelfTestPassed ? "PASS" : "FAIL");
+    Serial.print(" fast=");
+    Serial.print(state.quircFastSelfTestPassed ? "PASS" : "FAIL");
+    Serial.print(" full=");
+    Serial.print(state.quircFullSelfTestPassed ? "PASS" : "FAIL");
+    Serial.print(" zbar=");
+    Serial.print(state.zbarSelfTestPassed ? "PASS" : "FAIL");
+    Serial.print(" overall=");
     Serial.println(state.qrSelfTestPassed ? "PASS" : "FAIL");
 
     objectDetector.configVideo(nnConfig);
@@ -629,8 +868,7 @@ bool begin()
     nnStreamer.setTaskPriority();
     nnStreamer.registerOutput(objectDetector);
     if (nnStreamer.begin() != 0) return false;
-    Camera.channelBegin(QR_CHANNEL);
-    Camera.channelBegin(NN_CHANNEL);
+    nnStreamer.pause();
 
     state.ready = true;
     if (xTaskCreate(analysisTask, "CameraAnalysis", 10 * 1024, nullptr, 1,
@@ -638,7 +876,59 @@ bool begin()
         state.ready = false;
         return false;
     }
-    Serial.println("On-device vision ready: dedicated every-frame QR/color + YOLOv4-tiny");
+    if (BW21CAM_VISION_DEFAULT_ENABLED && !setEnabled(true)) {
+        state.ready = false;
+        return false;
+    }
+    Serial.print("On-device vision ready: fast/full quirc + timed ZBar fallback + "
+                 "YOLOv4-tiny; mode=");
+    Serial.println(state.enabled ? "vision" : "camera-only");
+    return true;
+}
+
+bool setEnabled(bool enabled)
+{
+    if (!stateMutex || !analysisMutex) return false;
+
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    const bool ready = state.ready;
+    const bool current = state.enabled;
+    xSemaphoreGive(stateMutex);
+    if (!ready) return false;
+    if (enabled == current) return true;
+
+    if (enabled) {
+        xSemaphoreTake(analysisMutex, portMAX_DELAY);
+        Camera.channelBegin(QR_CHANNEL);
+        Camera.channelBegin(NN_CHANNEL);
+        visionActive = true;
+        lastFullScanAtMs = 0;
+        lastZbarScanAtMs = 0;
+        lastColorSampleAtMs = 0;
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
+        state.enabled = true;
+        xSemaphoreGive(stateMutex);
+        nnStreamer.resume();
+        xSemaphoreGive(analysisMutex);
+    } else {
+        visionActive = false;
+        nnStreamer.pause();
+        xSemaphoreTake(analysisMutex, portMAX_DELAY);
+        Camera.channelEnd(NN_CHANNEL);
+        Camera.channelEnd(QR_CHANNEL);
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
+        state.enabled = false;
+        state.qrSeenAtMs = 0;
+        state.qrPayload[0] = 0;
+        state.objectCount = 0;
+        state.objectSeenAtMs = 0;
+        memset(state.objects, 0, sizeof(state.objects));
+        xSemaphoreGive(stateMutex);
+        xSemaphoreGive(analysisMutex);
+    }
+
+    Serial.print("Vision mode: ");
+    Serial.println(enabled ? "ON" : "OFF (camera-only)");
     return true;
 }
 
@@ -646,12 +936,41 @@ void getStatus(Status& status)
 {
     if (!stateMutex) {
         memset(&status, 0, sizeof(status));
-        status.enabled = true;
         return;
     }
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     status = state;
     xSemaphoreGive(stateMutex);
+}
+
+bool lockQrJpeg(const uint8_t*& jpeg, size_t& length)
+{
+    jpeg = nullptr;
+    length = 0;
+    if (!visionActive || !state.ready || !analysisMutex ||
+        xSemaphoreTake(analysisMutex, pdMS_TO_TICKS(1500)) != pdTRUE) {
+        return false;
+    }
+    if (!visionActive) {
+        xSemaphoreGive(analysisMutex);
+        return false;
+    }
+
+    uint32_t imageAddress = 0;
+    uint32_t imageLength = 0;
+    Camera.getImage(QR_CHANNEL, &imageAddress, &imageLength);
+    if (!imageAddress || !imageLength) {
+        xSemaphoreGive(analysisMutex);
+        return false;
+    }
+    jpeg = reinterpret_cast<const uint8_t*>(imageAddress);
+    length = imageLength;
+    return true;
+}
+
+void unlockQrJpeg()
+{
+    if (analysisMutex) xSemaphoreGive(analysisMutex);
 }
 
 }  // namespace OnDeviceVision
@@ -662,10 +981,13 @@ namespace OnDeviceVision {
 
 void configureCamera() {}
 bool begin() { return true; }
+bool setEnabled(bool) { return false; }
 void getStatus(Status& status)
 {
     memset(&status, 0, sizeof(status));
 }
+bool lockQrJpeg(const uint8_t*&, size_t&) { return false; }
+void unlockQrJpeg() {}
 
 }  // namespace OnDeviceVision
 

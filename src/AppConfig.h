@@ -2,7 +2,7 @@
 
 #include "BuildConfig.h"
 
-#define BW21CAM_VERSION "0.3.4-http-drain"
+#define BW21CAM_VERSION "0.3.9-vision-toggle"
 
 // Direct access-point mode matches the old ESP32-CAM test workflow.
 #define BW21CAM_USE_ACCESS_POINT 1
@@ -27,6 +27,7 @@
 #define BW21CAM_QR_STALE_MS 5000
 #define BW21CAM_OBJECT_STALE_MS 1500
 #define BW21CAM_VISION_MAX_OBJECTS 8
+#define BW21CAM_VISION_DEFAULT_ENABLED 0
 
 // PlatformIO enables this only in the bw21-cam-wk2132 environment.
 #define BW21CAM_FC_BAUD 115200

@@ -1,7 +1,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include "VideoStream.h"
+#include "server_drv.h"
 #include <lwip/sockets.h>
+
+extern "C" {
+#include "wifi_conf.h"
+}
 
 #undef read
 #undef write
@@ -16,12 +21,62 @@ namespace {
 
 constexpr uint8_t CAMERA_CHANNEL = 0;
 constexpr char STREAM_BOUNDARY[] = "bw21frame";
-constexpr uint32_t REQUEST_TIMEOUT_MS = 750;
-constexpr uint32_t CLIENT_WRITE_TIMEOUT_MS = 2500;
+constexpr uint32_t REQUEST_TIMEOUT_MS = 2000;
+constexpr uint32_t CLIENT_WRITE_TIMEOUT_MS = 2000;
 constexpr uint32_t SERIAL_STATUS_INTERVAL_MS = 5000;
 constexpr uint32_t FRAME_STALL_THRESHOLD_MS = 250;
-constexpr size_t TCP_WRITE_BLOCK_BYTES = 16 * 1024;
-constexpr int SOCKET_SCAN_LIMIT = 16;
+constexpr size_t TCP_WRITE_BLOCK_BYTES = 1460;
+constexpr uint8_t TCP_WRITE_BLOCKS_PER_YIELD = 8;
+constexpr uint8_t MAX_CONTROL_CLIENTS_PER_PASS = 4;
+
+class DriverClient {
+public:
+    DriverClient(ServerDrv& driver, int socket) : driver_(driver), socket_(socket) {}
+    ~DriverClient() { stop(); }
+
+    DriverClient(const DriverClient&) = delete;
+    DriverClient& operator=(const DriverClient&) = delete;
+
+    explicit operator bool() const { return socket_ >= 0; }
+
+    bool connected() const { return socket_ >= 0; }
+
+    int read(uint8_t* data, size_t length)
+    {
+        if (socket_ < 0 || !data || !length) return -1;
+        const int result = driver_.getDataBuf(socket_, data, length);
+        if (result <= 0) stop();
+        return result;
+    }
+
+    size_t write(const uint8_t* data, size_t length)
+    {
+        if (socket_ < 0 || !data || !length) return 0;
+        const int result = driver_.sendData(socket_, data, length);
+        if (result > 0) return static_cast<size_t>(result);
+        Serial.print("TCP send failed fd=");
+        Serial.print(socket_);
+        Serial.print(" requested=");
+        Serial.print(length);
+        Serial.print(" result=");
+        Serial.print(result);
+        Serial.print(" errno=");
+        Serial.println(driver_.getLastErrno(socket_));
+        stop();
+        return 0;
+    }
+
+    void stop()
+    {
+        if (socket_ < 0) return;
+        driver_.stopSocket(socket_);
+        socket_ = -1;
+    }
+
+private:
+    ServerDrv& driver_;
+    int socket_;
+};
 
 struct StreamProfile {
     const char* name;
@@ -41,8 +96,10 @@ constexpr int DEFAULT_PROFILE = 0;
 VideoSetting streamConfig(BW21CAM_STREAM_WIDTH, BW21CAM_STREAM_HEIGHT,
                           PROFILES[DEFAULT_PROFILE].fps, VIDEO_JPEG, 1);
 CameraSetting cameraSettings;
-WiFiServer controlServer(BW21CAM_CONTROL_PORT);
-WiFiServer streamServer(BW21CAM_STREAM_PORT);
+ServerDrv controlDriver;
+ServerDrv streamDriver;
+int controlListenSocket = -1;
+int streamListenSocket = -1;
 
 volatile int activeProfile = DEFAULT_PROFILE;
 volatile int pendingProfile = -1;
@@ -58,52 +115,46 @@ volatile uint32_t maxSendMs = 0;
 volatile uint32_t maxFrameGapMs = 0;
 volatile uint32_t lastCameraFrameMs = 0;
 
-bool configureAcceptedSocket(uint16_t localPort)
+void configureClientSocket(ServerDrv& driver, int socket)
 {
-    bool found = false;
-    bool configured = true;
-    for (int socket = 0; socket < SOCKET_SCAN_LIMIT; socket++) {
-        sockaddr_in localAddress = {};
-        sockaddr_in peerAddress = {};
-        socklen_t localLength = sizeof(localAddress);
-        socklen_t peerLength = sizeof(peerAddress);
-        if (lwip_getsockname(socket, reinterpret_cast<sockaddr*>(&localAddress),
-                             &localLength) != 0 ||
-            localAddress.sin_family != AF_INET ||
-            ntohs(localAddress.sin_port) != localPort ||
-            lwip_getpeername(socket, reinterpret_cast<sockaddr*>(&peerAddress),
-                             &peerLength) != 0) {
-            continue;
-        }
+    if (socket < 0) return;
+    const int timeoutMs = CLIENT_WRITE_TIMEOUT_MS;
+    driver.setSockRecvTimeout(socket, REQUEST_TIMEOUT_MS);
+    lwip_setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeoutMs, sizeof(timeoutMs));
+}
 
-        found = true;
-        const int timeoutMs = CLIENT_WRITE_TIMEOUT_MS;
-        const int enabled = 1;
-        const int keepIdleSeconds = 3;
-        const int keepIntervalSeconds = 1;
-        const int keepCount = 2;
-        const bool socketConfigured =
-            lwip_setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeoutMs,
-                            sizeof(timeoutMs)) == 0 &&
-            lwip_setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, &enabled,
-                            sizeof(enabled)) == 0 &&
-            lwip_setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &enabled,
-                            sizeof(enabled)) == 0 &&
-            lwip_setsockopt(socket, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdleSeconds,
-                            sizeof(keepIdleSeconds)) == 0 &&
-            lwip_setsockopt(socket, IPPROTO_TCP, TCP_KEEPINTVL, &keepIntervalSeconds,
-                            sizeof(keepIntervalSeconds)) == 0 &&
-            lwip_setsockopt(socket, IPPROTO_TCP, TCP_KEEPCNT, &keepCount,
-                            sizeof(keepCount)) == 0;
-        configured = configured && socketConfigured;
-    }
-    return found && configured;
+int createListenSocket(ServerDrv& driver, uint16_t port)
+{
+    return driver.startServer(port, TCP_MODE, NON_BLOCKING_MODE);
+}
+
+bool socketReadable(int socket)
+{
+    if (socket < 0) return false;
+    fd_set sockets;
+    FD_ZERO(&sockets);
+    FD_SET(socket, &sockets);
+    timeval timeout = {};
+    return lwip_select(socket + 1, &sockets, nullptr, nullptr, &timeout) > 0;
+}
+
+int acceptSocket(ServerDrv& driver, int listenSocket, const char* label)
+{
+    if (!socketReadable(listenSocket)) return -1;
+    const int socket = driver.getAvailable(listenSocket);
+    if (socket < 0) return -1;
+    Serial.print(label);
+    Serial.print(" socket accepted fd=");
+    Serial.println(socket);
+    configureClientSocket(driver, socket);
+    return socket;
 }
 
 #if BW21CAM_USE_ACCESS_POINT
 char apSsid[] = BW21CAM_AP_SSID;
 char apPassword[] = BW21CAM_AP_PASSWORD;
 char apChannel[] = BW21CAM_AP_CHANNEL;
+char apFallbackChannel[] = BW21CAM_AP_FALLBACK_CHANNEL;
 #else
 char stationSsid[] = BW21CAM_STATION_SSID;
 char stationPassword[] = BW21CAM_STATION_PASSWORD;
@@ -167,20 +218,30 @@ const char INDEX_HTML[] = R"HTML(<!doctype html>
 </body>
 </html>)HTML";
 
-bool writeAll(WiFiClient& client, const uint8_t* data, size_t length)
+bool writeAll(DriverClient& client, const uint8_t* data, size_t length)
 {
     size_t sent = 0;
+    uint8_t blocksSinceYield = 0;
+    const uint32_t startedMs = millis();
     uint32_t lastProgressMs = millis();
-    while (sent < length && client.connected()) {
+    while (sent < length && client) {
+        if (millis() - startedMs >= CLIENT_WRITE_TIMEOUT_MS) {
+            return false;
+        }
         size_t block = length - sent;
         if (block > TCP_WRITE_BLOCK_BYTES) {
             block = TCP_WRITE_BLOCK_BYTES;
         }
         const size_t written = client.write(data + sent, block);
-        if (written > 0) {
+        if (written > 0 && written <= block) {
             sent += written;
             lastProgressMs = millis();
+            if (++blocksSinceYield >= TCP_WRITE_BLOCKS_PER_YIELD) {
+                blocksSinceYield = 0;
+                vTaskDelay(1);
+            }
         } else {
+            if (!client.connected()) return false;
             if (millis() - lastProgressMs >= CLIENT_WRITE_TIMEOUT_MS) {
                 return false;
             }
@@ -190,29 +251,39 @@ bool writeAll(WiFiClient& client, const uint8_t* data, size_t length)
     return sent == length;
 }
 
-bool writeText(WiFiClient& client, const char* text)
+bool writeText(DriverClient& client, const char* text)
 {
     return writeAll(client, reinterpret_cast<const uint8_t*>(text), strlen(text));
 }
 
-bool readRequestLine(WiFiClient& client, char* line, size_t capacity)
+bool readHttpRequest(DriverClient& client, char* requestLine, size_t capacity)
 {
     const uint32_t startedMs = millis();
     size_t position = 0;
+    bool requestLineComplete = false;
+    uint32_t headerTail = 0;
     while (client.connected() && millis() - startedMs < REQUEST_TIMEOUT_MS) {
-        while (client.available() > 0) {
-            const char value = static_cast<char>(client.read());
-            if (value == '\n') {
-                line[position] = 0;
-                return position > 0;
+        uint8_t buffer[192];
+        const int received = client.read(buffer, sizeof(buffer));
+        if (received <= 0) break;
+        for (int index = 0; index < received; index++) {
+            const char value = static_cast<char>(buffer[index]);
+            headerTail = (headerTail << 8) | static_cast<uint8_t>(value);
+            if (!requestLineComplete) {
+                if (value == '\n') {
+                    requestLine[position] = 0;
+                    requestLineComplete = position > 0;
+                } else if (value != '\r' && position + 1 < capacity) {
+                    requestLine[position++] = value;
+                }
             }
-            if (value != '\r' && position + 1 < capacity) {
-                line[position++] = value;
+            if (requestLineComplete &&
+                (headerTail == 0x0d0a0d0aU || (headerTail & 0xffffU) == 0x0a0aU)) {
+                return true;
             }
         }
-        delay(1);
     }
-    line[position] = 0;
+    requestLine[position] = 0;
     return false;
 }
 
@@ -229,17 +300,7 @@ bool requestTargets(const char* request, const char* path)
             target[pathLength] == 0);
 }
 
-void drainHeaders(WiFiClient& client)
-{
-    char line[160];
-    while (readRequestLine(client, line, sizeof(line))) {
-        if (line[0] == 0) {
-            break;
-        }
-    }
-}
-
-void sendResponse(WiFiClient& client, int code, const char* reason,
+void sendResponse(DriverClient& client, int code, const char* reason,
                   const char* contentType, const char* body)
 {
     char header[240];
@@ -247,11 +308,16 @@ void sendResponse(WiFiClient& client, int code, const char* reason,
              "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %lu\r\n"
              "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
              code, reason, contentType, static_cast<unsigned long>(strlen(body)));
-    writeText(client, header);
-    writeText(client, body);
+    const bool sent = writeText(client, header) && writeText(client, body);
+    Serial.print("HTTP response code=");
+    Serial.print(code);
+    Serial.print(" body_bytes=");
+    Serial.print(strlen(body));
+    Serial.print(" sent=");
+    Serial.println(sent ? 1 : 0);
 }
 
-void sendStatus(WiFiClient& client)
+void sendStatus(DriverClient& client)
 {
     const int profileId = activeProfile;
     const StreamProfile& profile = PROFILES[profileId];
@@ -319,7 +385,7 @@ size_t appendJsonString(char* destination, size_t capacity, size_t used, const c
     return appendText(destination, capacity, used, "\"");
 }
 
-void sendVision(WiFiClient& client)
+void sendVision(DriverClient& client)
 {
     static OnDeviceVision::Status vision;
     OnDeviceVision::getStatus(vision);
@@ -391,15 +457,15 @@ void sendVision(WiFiClient& client)
     sendResponse(client, 200, "OK", "application/json", json);
 }
 
-void handleControlClient(WiFiClient& client)
+void handleControlClient(DriverClient& client)
 {
     char request[192];
-    if (!readRequestLine(client, request, sizeof(request))) {
-        client.stop();
+    if (!readHttpRequest(client, request, sizeof(request))) {
+        Serial.println("HTTP request headers timed out");
         return;
     }
-    drainHeaders(client);
-
+    Serial.print("HTTP request: ");
+    Serial.println(request);
     if (requestTargets(request, "/api/status")) {
         sendStatus(client);
     } else if (requestTargets(request, "/api/vision")) {
@@ -422,7 +488,16 @@ void handleControlClient(WiFiClient& client)
         sendResponse(client, 404, "Not Found", "text/plain", "Not found");
     }
     delay(1);
-    client.stop();
+}
+
+void serviceControlClients()
+{
+    for (uint8_t handled = 0; handled < MAX_CONTROL_CLIENTS_PER_PASS; handled++) {
+        const int socket = acceptSocket(controlDriver, controlListenSocket, "Control");
+        if (socket < 0) break;
+        DriverClient client(controlDriver, socket);
+        handleControlClient(client);
+    }
 }
 
 void applyPendingProfile()
@@ -451,7 +526,7 @@ void applyPendingProfile()
     Serial.println(profile.jpegQuality);
 }
 
-bool sendStreamHeader(WiFiClient& client)
+bool sendStreamHeader(DriverClient& client)
 {
     char header[240];
     snprintf(header, sizeof(header),
@@ -461,19 +536,6 @@ bool sendStreamHeader(WiFiClient& client)
              "Connection: close\r\n\r\n--%s\r\n",
              STREAM_BOUNDARY, STREAM_BOUNDARY);
     return writeText(client, header);
-}
-
-void controlTask(void*)
-{
-    for (;;) {
-        WiFiClient client = controlServer.available();
-        if (client) {
-            if (!configureAcceptedSocket(BW21CAM_CONTROL_PORT)) {
-                Serial.println("Control socket timeout configuration failed");
-            }
-            handleControlClient(client);
-        }
-    }
 }
 
 bool captureCameraFrame(uint32_t& imageAddress, uint32_t& imageLength,
@@ -511,77 +573,73 @@ void finishFrameInterval(uint32_t frameStartedMs)
     }
 }
 
-void streamTask(void*)
+void handleStreamClient(DriverClient& client)
+{
+    char request[160];
+    if (!readHttpRequest(client, request, sizeof(request))) {
+        streamRejectCount++;
+        Serial.println("Stream request headers timed out");
+        return;
+    }
+    if (!requestTargets(request, "/stream")) {
+        streamRejectCount++;
+        Serial.print("Rejected stream request: ");
+        Serial.println(request);
+        sendResponse(client, 404, "Not Found", "text/plain", "Use /stream");
+        return;
+    }
+
+    streamClientCount++;
+    Serial.println("Camera viewer connected");
+    if (!sendStreamHeader(client)) {
+        streamErrorCount++;
+        return;
+    }
+
+    while (client.connected()) {
+        applyPendingProfile();
+        serviceControlClients();
+        uint32_t imageAddress = 0;
+        uint32_t imageLength = 0;
+        uint32_t frameStartedMs = 0;
+        if (!captureCameraFrame(imageAddress, imageLength, frameStartedMs)) {
+            vTaskDelay(2 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        char partHeader[128];
+        snprintf(partHeader, sizeof(partHeader),
+                 "Content-Type: image/jpeg\r\nContent-Length: %lu\r\n\r\n",
+                 static_cast<unsigned long>(imageLength));
+        const uint32_t sendStartedMs = millis();
+        const bool frameSent =
+            writeText(client, partHeader) &&
+            writeAll(client, reinterpret_cast<const uint8_t*>(imageAddress), imageLength) &&
+            writeText(client, "\r\n--bw21frame\r\n");
+        const uint32_t sendDurationMs = millis() - sendStartedMs;
+        if (sendDurationMs > maxSendMs) maxSendMs = sendDurationMs;
+        if (!frameSent) {
+            streamErrorCount++;
+            break;
+        }
+        frameCount++;
+        finishFrameInterval(frameStartedMs);
+    }
+    Serial.println("Camera viewer disconnected");
+}
+
+void networkTask(void*)
 {
     for (;;) {
         applyPendingProfile();
-        WiFiClient client = streamServer.available();
-        if (!client) {
-            vTaskDelay(10 / portTICK_PERIOD_MS);
+        serviceControlClients();
+        const int socket = acceptSocket(streamDriver, streamListenSocket, "Stream");
+        if (socket < 0) {
+            vTaskDelay(1);
             continue;
         }
-
-        char request[160];
-        if (!readRequestLine(client, request, sizeof(request))) {
-            streamRejectCount++;
-            Serial.println("Stream request timed out");
-            client.stop();
-            continue;
-        }
-        drainHeaders(client);
-        if (!requestTargets(request, "/stream")) {
-            streamRejectCount++;
-            Serial.print("Rejected stream request: ");
-            Serial.println(request);
-            sendResponse(client, 404, "Not Found", "text/plain", "Use /stream");
-            client.stop();
-            continue;
-        }
-
-        streamClientCount++;
-        Serial.println("Camera viewer connected");
-        if (!configureAcceptedSocket(BW21CAM_STREAM_PORT)) {
-            Serial.println("Stream socket timeout configuration failed");
-        }
-        if (!sendStreamHeader(client)) {
-            streamErrorCount++;
-            client.stop();
-            continue;
-        }
-
-        while (client.connected()) {
-            applyPendingProfile();
-            uint32_t imageAddress = 0;
-            uint32_t imageLength = 0;
-            uint32_t frameStartedMs = 0;
-            if (!captureCameraFrame(imageAddress, imageLength, frameStartedMs)) {
-                vTaskDelay(2 / portTICK_PERIOD_MS);
-                continue;
-            }
-
-            char partHeader[128];
-            snprintf(partHeader, sizeof(partHeader),
-                     "Content-Type: image/jpeg\r\nContent-Length: %lu\r\n\r\n",
-                     static_cast<unsigned long>(imageLength));
-            const uint32_t sendStartedMs = millis();
-            const bool frameSent =
-                writeText(client, partHeader) &&
-                writeAll(client, reinterpret_cast<const uint8_t*>(imageAddress), imageLength) &&
-                writeText(client, "\r\n--bw21frame\r\n");
-            const uint32_t sendDurationMs = millis() - sendStartedMs;
-            if (sendDurationMs > maxSendMs) {
-                maxSendMs = sendDurationMs;
-            }
-            if (!frameSent) {
-                streamErrorCount++;
-                break;
-            }
-            frameCount++;
-            finishFrameInterval(frameStartedMs);
-        }
-
-        client.stop();
-        Serial.println("Camera viewer disconnected");
+        DriverClient client(streamDriver, socket);
+        handleStreamClient(client);
     }
 }
 
@@ -589,15 +647,31 @@ void startWifi()
 {
     int status = WL_IDLE_STATUS;
 #if BW21CAM_USE_ACCESS_POINT
+    char* selectedChannel = apChannel;
+    bool tried5G = strcmp(apChannel, apFallbackChannel) != 0;
     Serial.print("Starting access point: ");
-    Serial.println(apSsid);
+    Serial.print(apSsid);
+    Serial.print(" channel=");
+    Serial.println(selectedChannel);
     while (status != WL_CONNECTED) {
-        status = WiFi.apbegin(apSsid, apPassword, apChannel, 0);
+        status = WiFi.apbegin(apSsid, apPassword, selectedChannel, 0);
         if (status != WL_CONNECTED) {
-            Serial.println("Access point start failed; retrying");
+            if (tried5G) {
+                tried5G = false;
+                selectedChannel = apFallbackChannel;
+                Serial.println("5 GHz AP failed; falling back to 2.4 GHz channel 6");
+            } else {
+                Serial.println("Access point start failed; retrying");
+            }
             delay(3000);
         }
     }
+    uint8_t activeChannel = 0;
+    wifi_get_channel(&activeChannel);
+    Serial.print("Access point active on ");
+    Serial.print(activeChannel > 14 ? "5 GHz" : "2.4 GHz");
+    Serial.print(" channel ");
+    Serial.println(activeChannel);
 #else
     Serial.print("Connecting to Wi-Fi: ");
     Serial.println(stationSsid);
@@ -782,17 +856,24 @@ void setup()
     startCamera();
     FcLink::begin();
 
-    controlServer.begin();
-    streamServer.begin();
-    const BaseType_t controlStarted =
-        xTaskCreate(controlTask, "CameraControl", 10 * 1024, nullptr, 1, nullptr);
-    const BaseType_t streamStarted =
-        xTaskCreate(streamTask, "CameraStream", 10 * 1024, nullptr, 2, nullptr);
-    if (controlStarted != pdPASS || streamStarted != pdPASS) {
-        Serial.print("Server task start failed control=");
-        Serial.print(controlStarted);
+    controlListenSocket = createListenSocket(controlDriver, BW21CAM_CONTROL_PORT);
+    streamListenSocket = createListenSocket(streamDriver, BW21CAM_STREAM_PORT);
+    if (controlListenSocket < 0 || streamListenSocket < 0) {
+        Serial.print("Listen socket start failed control=");
+        Serial.print(controlListenSocket);
         Serial.print(" stream=");
-        Serial.println(streamStarted);
+        Serial.println(streamListenSocket);
+    } else {
+        Serial.print("HTTP listeners ready control_fd=");
+        Serial.print(controlListenSocket);
+        Serial.print(" stream_fd=");
+        Serial.println(streamListenSocket);
+        const BaseType_t networkStarted =
+            xTaskCreate(networkTask, "CameraNetwork", 14 * 1024, nullptr, 2, nullptr);
+        if (networkStarted != pdPASS) {
+            Serial.print("Network task start failed status=");
+            Serial.println(networkStarted);
+        }
     }
     Serial.println("Camera test ready");
 }

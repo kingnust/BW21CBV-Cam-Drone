@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import http.client
 import socket
 import threading
 import time
@@ -203,7 +204,7 @@ class MjpegFrameSource:
                             self._sequence += 1
                             self.stats.frames_received += 1
                             yield EncodedFrame(self._sequence, batch_received_ns, jpeg)
-            except (OSError, TimeoutError, ConnectionError) as error:
+            except (OSError, TimeoutError, ConnectionError, http.client.HTTPException) as error:
                 self.stats.last_error = str(error)
                 self.stats.reconnects += 1
                 if self._stop.wait(delay_s):
@@ -333,6 +334,16 @@ class EveryFrameQrScanner:
         payload, points, _ = method(image)
         return ([str(payload)] if payload else []), self._points(points, offset, scale)
 
+    @staticmethod
+    def _attempt(method: Any, *args: Any, **kwargs: Any) -> tuple[
+        list[str], list[tuple[tuple[float, float], ...]], int
+    ]:
+        try:
+            payloads, points = method(*args, **kwargs)
+            return payloads, points, 0
+        except cv2.error:
+            return [], [], 1
+
     def _primary_image(self, image: np.ndarray) -> tuple[np.ndarray, tuple[float, float]]:
         height, width = image.shape[:2]
         if width <= self.primary_width:
@@ -346,14 +357,19 @@ class EveryFrameQrScanner:
         self._frame_index += 1
         primary, primary_scale = self._primary_image(image)
         attempts = 1
-        payloads, points = self._multi(primary, scale=primary_scale)
+        payloads, points, decode_errors = self._attempt(
+            self._multi, primary, scale=primary_scale
+        )
         candidates = len(points)
-        decode_errors = candidates if candidates and not payloads else 0
+        decode_errors += candidates if candidates and not payloads else 0
 
         fallback_phase = (self._frame_index - 1) % 12
         if not payloads and self.robust and fallback_phase == 0:
             attempts += 1
-            curved_payloads, curved_points = self._single(primary, curved=True, scale=primary_scale)
+            curved_payloads, curved_points, attempt_errors = self._attempt(
+                self._single, primary, curved=True, scale=primary_scale
+            )
+            decode_errors += attempt_errors
             payloads.extend(curved_payloads)
             points.extend(curved_points)
             candidates += len(curved_points)
@@ -364,7 +380,10 @@ class EveryFrameQrScanner:
             grey = cv2.cvtColor(primary, cv2.COLOR_BGR2GRAY)
             contrast = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(grey)
             attempts += 1
-            contrast_payloads, contrast_points = self._multi(contrast, scale=primary_scale)
+            contrast_payloads, contrast_points, attempt_errors = self._attempt(
+                self._multi, contrast, scale=primary_scale
+            )
+            decode_errors += attempt_errors
             payloads.extend(contrast_payloads)
             points.extend(contrast_points)
             candidates += len(contrast_points)
@@ -384,7 +403,10 @@ class EveryFrameQrScanner:
             left, top = offsets[fallback_phase - 2]
             attempts += 1
             tile = image[top : top + tile_height, left : left + tile_width]
-            tile_payloads, tile_points = self._single(tile, offset=(left, top))
+            tile_payloads, tile_points, attempt_errors = self._attempt(
+                self._single, tile, offset=(left, top)
+            )
+            decode_errors += attempt_errors
             payloads.extend(tile_payloads)
             points.extend(tile_points)
             candidates += len(tile_points)

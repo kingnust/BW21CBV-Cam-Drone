@@ -2,13 +2,14 @@
 
 #include "BuildConfig.h"
 
-#define BW21CAM_VERSION "0.2.1-vision"
+#define BW21CAM_VERSION "0.3.4-http-drain"
 
 // Direct access-point mode matches the old ESP32-CAM test workflow.
 #define BW21CAM_USE_ACCESS_POINT 1
 #define BW21CAM_AP_SSID "BW21-CAM-TEST"
 #define BW21CAM_AP_PASSWORD "12345678"
-#define BW21CAM_AP_CHANNEL "6"
+#define BW21CAM_AP_CHANNEL "36"
+#define BW21CAM_AP_FALLBACK_CHANNEL "6"
 
 // Used only when BW21CAM_USE_ACCESS_POINT is 0.
 #define BW21CAM_STATION_SSID "YOUR_WIFI_SSID"

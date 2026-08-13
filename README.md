@@ -67,7 +67,7 @@ platformio run -e bw21-cam-vision -t upload
 ```
 
 The vision build continuously analyzes the exact captured JPEG frames, even
-when no browser is connected. A dedicated 640 x 360 camera channel scans every
+when no browser is connected. A dedicated 640 x 480 camera channel scans every
 analysis frame for QR codes and calculates per-object color without blocking
 the live stream, while the Realtek NN engine runs YOLOv4-tiny on a separate
 576 x 320, 10 FPS camera channel. Results and stale

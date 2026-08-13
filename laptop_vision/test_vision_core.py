@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import http.client
 import threading
 import tempfile
 import time
@@ -47,6 +48,14 @@ class FakeQrDetector:
         return "", None, None
 
 
+class FlakyQrDetector(FakeQrDetector):
+    def detectAndDecodeMulti(self, image):
+        if self.calls == 0:
+            self.calls += 1
+            raise cv2.error("temporary QR decoder failure")
+        return super().detectAndDecodeMulti(image)
+
+
 class BlockingObjectDetector:
     def __init__(self) -> None:
         self.started = threading.Event()
@@ -76,6 +85,13 @@ class BufferedResponse:
 
     def read(self, _size: int) -> bytes:
         raise AssertionError("low-latency source must use read1 when available")
+
+
+class TruncatedResponse(BufferedResponse):
+    def read1(self, size: int) -> bytes:
+        if self.payload:
+            return super().read1(size)
+        raise http.client.IncompleteRead(b"partial")
 
 
 class VisionCoreTests(unittest.TestCase):
@@ -181,6 +197,22 @@ class VisionCoreTests(unittest.TestCase):
         self.assertGreaterEqual(source.stats.connections, 2)
         self.assertGreaterEqual(source.stats.reconnects, 1)
 
+    def test_incomplete_http_read_reconnects_without_losing_recovered_frame(self):
+        jpeg = self.make_qr_jpeg("RECOVERED-QR")
+        responses = [TruncatedResponse(jpeg), BufferedResponse(jpeg)]
+        source = MjpegFrameSource(
+            "http://camera.invalid/stream", reconnect_min_s=0.001, reconnect_max_s=0.001
+        )
+        with patch("vision_core.urllib.request.urlopen", side_effect=responses):
+            iterator = source.frames()
+            first = next(iterator)
+            second = next(iterator)
+            source.stop()
+            iterator.close()
+        self.assertEqual([first.sequence, second.sequence], [1, 2])
+        self.assertEqual(source.stats.connections, 2)
+        self.assertEqual(source.stats.reconnects, 1)
+
     def test_qr_scanner_checks_each_supplied_frame(self):
         detector = FakeQrDetector()
         scanner = EveryFrameQrScanner(robust=True, detector=detector)
@@ -190,6 +222,17 @@ class VisionCoreTests(unittest.TestCase):
             self.assertEqual(result.payloads, ("TEST-QR",))
             self.assertGreaterEqual(result.attempts, 1)
         self.assertEqual(detector.calls, 7)
+
+    def test_qr_decoder_exception_is_contained_to_one_checked_frame(self):
+        detector = FlakyQrDetector()
+        scanner = EveryFrameQrScanner(robust=False, detector=detector)
+        image = np.zeros((20, 20, 3), dtype=np.uint8)
+        failed = scanner.scan(image)
+        recovered = scanner.scan(image)
+        self.assertEqual(failed.payloads, ())
+        self.assertEqual(failed.decode_errors, 1)
+        self.assertEqual(recovered.payloads, ("TEST-QR",))
+        self.assertEqual(detector.calls, 2)
 
     def test_latest_frame_slot_never_returns_backlog(self):
         slot = LatestFrameSlot()

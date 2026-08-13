@@ -71,6 +71,28 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def verify_embedded_variant(path, expected_variant):
+    image = path.read_bytes()
+    expected = expected_variant.encode("ascii") + b"\0"
+    if expected not in image:
+        raise RuntimeError(
+            f"Firmware does not embed the expected build variant {expected_variant!r}"
+        )
+    known_variants = (
+        "bw21-cam-test",
+        "bw21-cam-wk2132",
+        "bw21-cam-vision",
+        "bw21-cam-vision-wk2132",
+    )
+    conflicts = [
+        variant
+        for variant in known_variants
+        if variant != expected_variant and variant.encode("ascii") + b"\0" in image
+    ]
+    if conflicts:
+        raise RuntimeError("Firmware embeds conflicting build variant(s): " + ", ".join(conflicts))
+
+
 @contextmanager
 def realtek_tool_lock():
     REALTEK_TOOL_LOCK.parent.mkdir(parents=True, exist_ok=True)
@@ -495,6 +517,7 @@ def validated_upload_image():
         )
     if mismatches:
         raise RuntimeError("Refusing mismatched upload artifact: " + "; ".join(mismatches))
+    verify_embedded_variant(image_path, expected["variant"])
     return image_path, digest
 
 
@@ -659,6 +682,7 @@ def upload_firmware(target, source, env):
             shared_image = stage_realtek_upload_image(
                 image_path, image_digest, core_version
             )
+            verify_embedded_variant(shared_image, env.subst("$PIOENV"))
             print(
                 f"Staged {env.subst('$PIOENV')} upload image: "
                 f"sha256={image_digest}"

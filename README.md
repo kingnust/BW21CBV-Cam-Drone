@@ -80,9 +80,11 @@ Realtek NN engine runs YOLOv4-tiny on a separate 576 x 320, 10 FPS channel.
 Results, fast/full scan counters, and stage timings are available in the web
 page, `/api/status`, and `/api/vision`.
 
-Use `bw21-cam-vision-wk2132` to add the FC link. A newly decoded QR payload is
-then sent through the existing acknowledged MSP2 QR transport. Ordinary camera
-and WK2132 builds do not initialize QR or neural-network code.
+Use `bw21-cam-vision-wk2132` to add the FC link. The camera sends each decoded
+QR payload plus normalized center, apparent size, image area, and orientation
+through the acknowledged MSP2 v2 transport. A still-visible code is refreshed
+at up to 4 Hz for localization filtering. Ordinary camera and WK2132 builds do
+not initialize QR or neural-network code.
 
 ### Laptop vision
 
@@ -124,14 +126,15 @@ The included link layer then:
 - uses `Serial1`, which maps to BW21 D21/D22;
 - queries the FC MSP API once per second as a link heartbeat;
 - validates MSP v1 and MSP v2 checksums;
-- exposes the existing reliable MSP2 QR-result publish/acknowledgement path for
-  later QR scanning firmware.
+- exposes the reliable MSP2 QR observation and acknowledgement path.
 
 The matching flight-controller environment is
 `drone_proto_esp32s3_wk2132_experimental`. It routes the WK2132 camera UART to
 a dedicated MSP parser while the WK2132 itself remains on the shared FC I2C
-bus. Use the FC CLI commands `wk2132` and `camera_uart` to inspect both sides of
-the link.
+bus. Use the FC CLI commands `wk2132`, `camstatus`, and `qrloc` to inspect the
+bridge, QR observations, and experimental fused position. The full landmark
+format and bench procedure are in the FC document
+`docs/drone-proto-qr-localization.md`.
 
 The camera-test and WK2132-only builds do not decode QR codes. Select one of the
 vision environments when onboard QR/object processing is required.

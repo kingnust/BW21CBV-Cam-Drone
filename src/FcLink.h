@@ -4,9 +4,22 @@
 
 namespace FcLink {
 
+struct QrObservation {
+    const char* payload;
+    bool geometryValid;
+    bool fullResolution;
+    bool mirrored;
+    bool zbarFallback;
+    uint16_t centerXPermille;
+    uint16_t centerYPermille;
+    uint16_t sidePermille;
+    uint16_t areaPermille;
+    int16_t rotationCdeg;
+};
+
 void begin();
 void update();
-bool publishQr(const char* payload);
+bool publishQr(const QrObservation& observation);
 
 bool connected();
 uint32_t requestCount();
@@ -19,4 +32,3 @@ uint8_t apiMajor();
 uint8_t apiMinor();
 
 }  // namespace FcLink
-

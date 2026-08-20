@@ -175,7 +175,7 @@ const char INDEX_HTML[] = R"HTML(<!doctype html>
     .toolbar{padding:10px 0;flex-wrap:wrap}.controls{display:flex;gap:8px;flex-wrap:wrap}.modes,.vision-modes{display:inline-grid;border:1px solid #3d4650}.modes{grid-template-columns:repeat(3,1fr)}.vision-modes{grid-template-columns:repeat(2,1fr)}
     button{height:38px;padding:0 12px;border:1px solid #3d4650;background:#1c2229;color:#eef2f5;font-weight:700;cursor:pointer}button.active{background:#50bd78;color:#07120b;border-color:#50bd78}button:disabled{opacity:.55;cursor:wait}
     .modes,.modes button,.vision-modes,.vision-modes button{min-width:0}.modes button,.vision-modes button{border-width:0 1px 0 0}.modes button:last-child,.vision-modes button:last-child{border-right:0}.metrics{display:flex;gap:14px;color:#b9c3cd;font-size:13px}.metrics b{color:#f1c75b}
-    .results{border-top:1px solid #303741;padding-top:10px}.qr{font-size:14px;color:#b9c3cd;overflow-wrap:anywhere}.qr b{color:#f4f6f8}.objects{display:flex;gap:8px;flex-wrap:wrap;margin-top:9px;min-height:30px}
+    .results{border-top:1px solid #303741;padding-top:10px}.qr{font-size:14px;color:#b9c3cd;overflow-wrap:anywhere}.qr b{color:#f4f6f8}.qr span{margin-left:8px;color:#f1c75b;font-size:12px}.objects{display:flex;gap:8px;flex-wrap:wrap;margin-top:9px;min-height:30px}
     .object{padding:6px 8px;border-left:3px solid #50bd78;background:#1a2026;color:#e6ebef;font-size:13px}.empty{color:#8f9aa5;font-size:13px}
     @media(max-width:560px){main{padding:10px}header{align-items:flex-start;flex-wrap:wrap}.toolbar{align-items:flex-start}.controls,.modes,.vision-modes{width:100%}.modes button,.vision-modes button{padding:0 4px}.metrics{width:100%;justify-content:space-between;gap:6px}}
   </style>
@@ -196,11 +196,11 @@ const char INDEX_HTML[] = R"HTML(<!doctype html>
       </div>
       <div class="metrics"><span><b id="fps">--</b> FPS</span><span>Q<b id="quality">--</b></span><span><b>1280x720</b></span></div>
     </div>
-    <div class="results"><div class="qr">QR <b id="qr">--</b></div><div id="objects" class="objects"><span class="empty">No objects</span></div></div>
+    <div class="results"><div class="qr">QR <b id="qr">--</b><span id="qrmeta"></span></div><div id="objects" class="objects"><span class="empty">No objects</span></div></div>
   </main>
   <script>
     const state=document.getElementById('state'),stream=document.getElementById('stream'),overlay=document.getElementById('overlay'),ctx=overlay.getContext('2d');
-    const buttons=[...document.querySelectorAll('button[data-profile]')],visionButtons=[...document.querySelectorAll('button[data-vision]')],mirror=document.getElementById('mirror'),objects=document.getElementById('objects');
+    const buttons=[...document.querySelectorAll('button[data-profile]')],visionButtons=[...document.querySelectorAll('button[data-vision]')],mirror=document.getElementById('mirror'),objects=document.getElementById('objects'),qrmeta=document.getElementById('qrmeta');
     let retryTimer=0,lastFrames=-1,lastProgressAt=Date.now(),pollBusy=false,visionSwitchBusy=false,mirrored=false;
     function markLive(text){if(retryTimer){clearTimeout(retryTimer);retryTimer=0}state.textContent=text}
     function connectStream(){retryTimer=0;lastProgressAt=Date.now();state.textContent='Connecting';stream.src='http://'+location.hostname+':81/stream?t='+Date.now()}
@@ -209,7 +209,7 @@ const char INDEX_HTML[] = R"HTML(<!doctype html>
     stream.onerror=()=>reconnect();
     function draw(v){const w=overlay.width=overlay.clientWidth*devicePixelRatio,h=overlay.height=overlay.clientHeight*devicePixelRatio;ctx.clearRect(0,0,w,h);if(!v.enabled)return;ctx.lineWidth=2*devicePixelRatio;ctx.font=(12*devicePixelRatio)+'px Arial';ctx.textBaseline='top';
       v.objects.forEach(o=>{const x=(mirrored?1-o.box[2]:o.box[0])*w,y=o.box[1]*h,bw=(o.box[2]-o.box[0])*w,bh=(o.box[3]-o.box[1])*h,label=o.name+' '+o.score+'% '+o.color;ctx.strokeStyle='#50bd78';ctx.fillStyle='#50bd78';ctx.strokeRect(x,y,bw,bh);const tw=ctx.measureText(label).width+8*devicePixelRatio,lh=18*devicePixelRatio;ctx.fillRect(x,Math.max(0,y-lh),tw,lh);ctx.fillStyle='#07120b';ctx.fillText(label,x+4*devicePixelRatio,Math.max(0,y-lh)+2*devicePixelRatio)})}
-    function render(v){document.getElementById('fps').textContent=v.fps;document.getElementById('quality').textContent=v.quality;buttons.forEach((b,i)=>b.classList.toggle('active',i===v.profile));visionButtons.forEach((b,i)=>{b.classList.toggle('active',i===Number(v.enabled));b.disabled=visionSwitchBusy||!v.ready});document.getElementById('qr').textContent=v.enabled&&v.qr.fresh?v.qr.payload:'--';objects.replaceChildren();
+    function render(v){document.getElementById('fps').textContent=v.fps;document.getElementById('quality').textContent=v.quality;buttons.forEach((b,i)=>b.classList.toggle('active',i===v.profile));visionButtons.forEach((b,i)=>{b.classList.toggle('active',i===Number(v.enabled));b.disabled=visionSwitchBusy||!v.ready});document.getElementById('qr').textContent=v.enabled&&v.qr.fresh?v.qr.payload:'--';qrmeta.textContent=v.enabled&&v.qr.fresh&&v.qr.geometry.valid?'x '+v.qr.geometry.center_permille[0]+' y '+v.qr.geometry.center_permille[1]+' size '+v.qr.geometry.side_permille:'';objects.replaceChildren();
       if(!v.enabled){const empty=document.createElement('span');empty.className='empty';empty.textContent=v.ready?'Vision off':'Vision unavailable';objects.appendChild(empty)}else if(v.objects.length){v.objects.forEach(o=>{const item=document.createElement('span');item.className='object';item.textContent=o.name+' '+o.score+'% | '+o.color+(o.color_confidence?' '+o.color_confidence+'%':'');objects.appendChild(item)})}else{const empty=document.createElement('span');empty.className='empty';empty.textContent='No objects';objects.appendChild(empty)}draw(v)}
     async function poll(){if(pollBusy)return;pollBusy=true;try{const r=await fetch('/api/vision',{cache:'no-store'});if(!r.ok)throw new Error('vision');const v=await r.json();render(v);const now=Date.now();
       if(lastFrames<0){lastFrames=v.stream_frames;lastProgressAt=now}else if(v.stream_frames!==lastFrames){lastFrames=v.stream_frames;lastProgressAt=now;markLive('Live')}else if(now-lastProgressAt>5000){reconnect(250)}
@@ -480,10 +480,20 @@ void sendVision(DriverClient& client)
     used = appendJsonString(json, sizeof(json), used, qrFresh ? vision.qrPayload : "");
     used = appendText(
         json, sizeof(json), used,
-        ",\"candidates\":%lu,\"no_finder\":%lu,\"decodes\":%lu,"
+        ",\"geometry\":{\"valid\":%s,\"full_resolution\":%s,"
+        "\"mirrored\":%s,\"zbar_fallback\":%s,\"center_permille\":[%u,%u],"
+        "\"side_permille\":%u,\"area_permille\":%u,\"rotation_cdeg\":%d},"
+        "\"candidates\":%lu,\"no_finder\":%lu,\"decodes\":%lu,"
         "\"decode_errors\":%lu,\"duplicates\":%lu},"
         "\"objects_fresh\":%s,\"objects_age_ms\":%lu,"
         "\"yolo_frames\":%lu,\"objects\":[",
+        vision.qrGeometry.valid ? "true" : "false",
+        vision.qrGeometry.fullResolution ? "true" : "false",
+        vision.qrGeometry.mirrored ? "true" : "false",
+        vision.qrGeometry.zbarFallback ? "true" : "false",
+        vision.qrGeometry.centerXPermille, vision.qrGeometry.centerYPermille,
+        vision.qrGeometry.sidePermille, vision.qrGeometry.areaPermille,
+        static_cast<int>(vision.qrGeometry.rotationCdeg),
         static_cast<unsigned long>(vision.qrCandidates),
         static_cast<unsigned long>(vision.qrNoFinderCenters),
         static_cast<unsigned long>(vision.qrDecodes),
@@ -898,7 +908,19 @@ void printVisionEvents()
     if (vision.qrSequence != lastQrSequence && vision.qrPayload[0]) {
         lastQrSequence = vision.qrSequence;
         Serial.print("VISION QR payload=");
-        Serial.println(vision.qrPayload);
+        Serial.print(vision.qrPayload);
+        Serial.print(" geometry=");
+        if (vision.qrGeometry.valid) {
+            Serial.print(vision.qrGeometry.centerXPermille);
+            Serial.print(',');
+            Serial.print(vision.qrGeometry.centerYPermille);
+            Serial.print(" side=");
+            Serial.print(vision.qrGeometry.sidePermille);
+            Serial.print(" rot_cdeg=");
+            Serial.println(vision.qrGeometry.rotationCdeg);
+        } else {
+            Serial.println("unavailable");
+        }
     }
 
     if (!vision.objectCount) {
@@ -981,8 +1003,20 @@ void loop()
     static uint32_t publishedQrSequence = 0;
     OnDeviceVision::Status vision = {};
     OnDeviceVision::getStatus(vision);
+    const FcLink::QrObservation observation = {
+        vision.qrPayload,
+        vision.qrGeometry.valid,
+        vision.qrGeometry.fullResolution,
+        vision.qrGeometry.mirrored,
+        vision.qrGeometry.zbarFallback,
+        vision.qrGeometry.centerXPermille,
+        vision.qrGeometry.centerYPermille,
+        vision.qrGeometry.sidePermille,
+        vision.qrGeometry.areaPermille,
+        vision.qrGeometry.rotationCdeg
+    };
     if (vision.qrSequence != publishedQrSequence && vision.qrPayload[0] &&
-        FcLink::publishQr(vision.qrPayload)) {
+        FcLink::publishQr(observation)) {
         publishedQrSequence = vision.qrSequence;
     }
 #endif

@@ -2,7 +2,7 @@
 
 #include "BuildConfig.h"
 
-#define BW21CAM_VERSION "0.3.9-vision-toggle"
+#define BW21CAM_VERSION "0.4.0-qr-localization"
 
 // Direct access-point mode matches the old ESP32-CAM test workflow.
 #define BW21CAM_USE_ACCESS_POINT 1

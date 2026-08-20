@@ -21,6 +21,18 @@ struct ObjectResult {
     float yMax;
 };
 
+struct QrGeometry {
+    bool valid;
+    bool fullResolution;
+    bool mirrored;
+    bool zbarFallback;
+    uint16_t centerXPermille;
+    uint16_t centerYPermille;
+    uint16_t sidePermille;
+    uint16_t areaPermille;
+    int16_t rotationCdeg;
+};
+
 struct Status {
     bool enabled;
     bool ready;
@@ -50,6 +62,8 @@ struct Status {
     uint32_t zbarFallbackScans;
     uint32_t qrSequence;
     uint32_t qrSeenAtMs;
+    uint32_t qrPublishedAtMs;
+    QrGeometry qrGeometry;
     uint32_t lastProcessMs;
     uint32_t maxProcessMs;
     uint32_t lastJpegDecodeMs;

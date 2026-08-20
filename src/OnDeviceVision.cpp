@@ -16,6 +16,7 @@
 #include "quirc.h"
 
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 namespace OnDeviceVision {
@@ -40,6 +41,7 @@ constexpr uint32_t QR_FULL_RETRY_MS = 250;
 constexpr uint32_t ZBAR_FALLBACK_MS = 1500;
 constexpr uint32_t COLOR_SAMPLE_MS = 250;
 constexpr uint32_t QR_REAPPEAR_MS = 1800;
+constexpr uint32_t QR_OBSERVATION_INTERVAL_MS = 250;
 constexpr uint32_t OBJECT_HOLD_MS = 700;
 constexpr float OBJECT_BOX_NEW_WEIGHT = 0.45f;
 constexpr uint8_t COLOR_COUNT = 12;
@@ -347,7 +349,87 @@ bool stretchContrast(uint8_t* luma, size_t pixels)
     return true;
 }
 
-bool acceptQrPayloadLocked(const uint8_t* payload, size_t length, uint32_t now)
+uint16_t toPermille(float value)
+{
+    return static_cast<uint16_t>(std::lround(clampUnit(value) * 1000.0f));
+}
+
+QrGeometry geometryFromQuirc(const struct quirc_code& code, uint16_t width,
+                             uint16_t height, bool fullResolution, bool mirrored)
+{
+    QrGeometry geometry = {};
+    if (width < 2 || height < 2) return geometry;
+
+    float centerX = 0.0f;
+    float centerY = 0.0f;
+    float side = 0.0f;
+    float twiceArea = 0.0f;
+    for (uint8_t i = 0; i < 4; i++) {
+        const quirc_point& current = code.corners[i];
+        const quirc_point& next = code.corners[(i + 1) & 3];
+        centerX += current.x;
+        centerY += current.y;
+        side += std::hypot(static_cast<float>(next.x - current.x),
+                           static_cast<float>(next.y - current.y));
+        twiceArea += static_cast<float>(current.x * next.y - next.x * current.y);
+    }
+    side *= 0.25f;
+    const float area = std::fabs(twiceArea) * 0.5f;
+    if (side < 4.0f || area < 16.0f) return geometry;
+
+    const float rotation = std::atan2(
+        static_cast<float>(code.corners[1].y - code.corners[0].y),
+        static_cast<float>(code.corners[1].x - code.corners[0].x));
+    geometry.valid = true;
+    geometry.fullResolution = fullResolution;
+    geometry.mirrored = mirrored;
+    geometry.centerXPermille = toPermille((centerX * 0.25f) / (width - 1));
+    geometry.centerYPermille = toPermille((centerY * 0.25f) / (height - 1));
+    geometry.sidePermille = toPermille(side / width);
+    geometry.areaPermille = toPermille(area / (static_cast<float>(width) * height));
+    geometry.rotationCdeg = static_cast<int16_t>(std::lround(
+        rotation * (18000.0f / 3.14159265358979323846f)));
+    return geometry;
+}
+
+QrGeometry geometryFromZbar(const zbar_symbol_t* symbol)
+{
+    QrGeometry geometry = {};
+    const unsigned int count = zbar_symbol_get_loc_size(symbol);
+    if (count < 4) return geometry;
+
+    int minimumX = QR_WIDTH;
+    int minimumY = QR_HEIGHT;
+    int maximumX = -1;
+    int maximumY = -1;
+    for (unsigned int i = 0; i < count; i++) {
+        const int x = zbar_symbol_get_loc_x(symbol, i);
+        const int y = zbar_symbol_get_loc_y(symbol, i);
+        minimumX = std::min(minimumX, x);
+        minimumY = std::min(minimumY, y);
+        maximumX = std::max(maximumX, x);
+        maximumY = std::max(maximumY, y);
+    }
+    const float width = maximumX - minimumX;
+    const float height = maximumY - minimumY;
+    const float side = (width + height) * 0.5f;
+    if (width < 4.0f || height < 4.0f) return geometry;
+
+    geometry.valid = true;
+    geometry.fullResolution = true;
+    geometry.zbarFallback = true;
+    geometry.centerXPermille = toPermille(
+        ((minimumX + maximumX) * 0.5f) / (QR_WIDTH - 1));
+    geometry.centerYPermille = toPermille(
+        ((minimumY + maximumY) * 0.5f) / (QR_HEIGHT - 1));
+    geometry.sidePermille = toPermille(side / QR_WIDTH);
+    geometry.areaPermille = toPermille(
+        (width * height) / (static_cast<float>(QR_WIDTH) * QR_HEIGHT));
+    return geometry;
+}
+
+bool acceptQrPayloadLocked(const uint8_t* payload, size_t length, uint32_t now,
+                           const QrGeometry& geometry)
 {
     if (!payload || length == 0 || length >= QR_PAYLOAD_CAPACITY ||
         !isValidUtf8Text(reinterpret_cast<const char*>(payload), length)) {
@@ -359,11 +441,15 @@ bool acceptQrPayloadLocked(const uint8_t* payload, size_t length, uint32_t now)
     const bool changed = strncmp(state.qrPayload, text, length) != 0 ||
                          state.qrPayload[length] != 0;
     const bool reappeared = state.qrSeenAtMs && now - state.qrSeenAtMs > QR_REAPPEAR_MS;
+    const bool observationDue = !state.qrPublishedAtMs ||
+                                now - state.qrPublishedAtMs >= QR_OBSERVATION_INTERVAL_MS;
     state.qrSeenAtMs = now;
     state.qrDecodes++;
-    if (changed || reappeared || state.qrSequence == 0) {
+    state.qrGeometry = geometry;
+    if (changed || reappeared || observationDue || state.qrSequence == 0) {
         memcpy(state.qrPayload, payload, length);
         state.qrPayload[length] = 0;
+        state.qrPublishedAtMs = now;
         state.qrSequence++;
     } else {
         state.qrDuplicates++;
@@ -421,8 +507,12 @@ bool scanWithQuirc(struct quirc* decoder, const uint8_t* luma, size_t pixels,
         xSemaphoreTake(stateMutex, portMAX_DELAY);
         if (error == QUIRC_SUCCESS) {
             if (mirrored) state.quircMirroredDecodes++;
+            const QrGeometry geometry = geometryFromQuirc(
+                quircCode, fullResolution ? QR_WIDTH : QR_FAST_WIDTH,
+                fullResolution ? QR_HEIGHT : QR_FAST_HEIGHT,
+                fullResolution, mirrored);
             const bool accepted = acceptQrPayloadLocked(
-                quircData.payload, quircData.payload_len, now);
+                quircData.payload, quircData.payload_len, now, geometry);
             if (!accepted) state.quircDecodeErrors++;
             xSemaphoreGive(stateMutex);
             if (accepted) return true;
@@ -449,7 +539,8 @@ bool scanWithZbar(uint32_t now, int& scanDetail)
         const uint8_t* payload = reinterpret_cast<const uint8_t*>(
             zbar_symbol_get_data(symbol));
         const size_t sourceLength = zbar_symbol_get_data_length(symbol);
-        accepted = acceptQrPayloadLocked(payload, sourceLength, now);
+        accepted = acceptQrPayloadLocked(
+            payload, sourceLength, now, geometryFromZbar(symbol));
         if (accepted) break;
     }
     xSemaphoreGive(stateMutex);
@@ -919,6 +1010,8 @@ bool setEnabled(bool enabled)
         xSemaphoreTake(stateMutex, portMAX_DELAY);
         state.enabled = false;
         state.qrSeenAtMs = 0;
+        state.qrPublishedAtMs = 0;
+        state.qrGeometry = {};
         state.qrPayload[0] = 0;
         state.objectCount = 0;
         state.objectSeenAtMs = 0;

@@ -14,6 +14,13 @@ constexpr uint32_t API_QUERY_INTERVAL_MS = 1000;
 constexpr uint32_t LINK_TIMEOUT_MS = 2500;
 constexpr uint32_t QR_RETRY_INTERVAL_MS = 500;
 constexpr size_t QR_MAX_PAYLOAD = 96;
+constexpr uint8_t CAMERA_PROTOCOL_VERSION = 2;
+constexpr uint8_t CAMERA_MESSAGE_QR = 1;
+constexpr uint8_t CAMERA_QR_HEADER_SIZE = 16;
+constexpr uint8_t QR_FLAG_GEOMETRY_VALID = 1 << 0;
+constexpr uint8_t QR_FLAG_FULL_RESOLUTION = 1 << 1;
+constexpr uint8_t QR_FLAG_MIRRORED = 1 << 2;
+constexpr uint8_t QR_FLAG_ZBAR_FALLBACK = 1 << 3;
 
 enum ParseState : uint8_t {
     SYNC_DOLLAR,
@@ -47,7 +54,7 @@ uint8_t majorVersion = 0;
 uint8_t minorVersion = 0;
 
 uint16_t qrSequence = 0;
-uint8_t qrPayload[5 + QR_MAX_PAYLOAD] = {};
+uint8_t qrPayload[CAMERA_QR_HEADER_SIZE + QR_MAX_PAYLOAD] = {};
 uint8_t qrPayloadLength = 0;
 uint32_t lastQrSendMs = 0;
 uint32_t qrSends = 0;
@@ -115,7 +122,7 @@ void acceptV2Frame(uint32_t now)
 
     const uint16_t sequence = parsePayload[2] |
                               (static_cast<uint16_t>(parsePayload[3]) << 8);
-    if (parsePayload[0] != 1 || sequence != qrSequence) {
+    if (parsePayload[0] != qrPayload[0] || sequence != qrSequence) {
         return;
     }
 
@@ -231,25 +238,39 @@ void update()
     }
 }
 
-bool publishQr(const char* payload)
+void writeU16(uint8_t* destination, uint16_t value)
 {
-    if (!payload || !payload[0] || qrPending) {
+    destination[0] = static_cast<uint8_t>(value);
+    destination[1] = static_cast<uint8_t>(value >> 8);
+}
+
+bool publishQr(const QrObservation& observation)
+{
+    if (!observation.payload || !observation.payload[0] || qrPending) {
         return false;
     }
 
-    size_t length = strlen(payload);
+    size_t length = strlen(observation.payload);
     if (length > QR_MAX_PAYLOAD) {
         length = QR_MAX_PAYLOAD;
     }
 
     qrSequence++;
-    qrPayload[0] = 1;
-    qrPayload[1] = 1;
-    qrPayload[2] = static_cast<uint8_t>(qrSequence);
-    qrPayload[3] = static_cast<uint8_t>(qrSequence >> 8);
+    qrPayload[0] = CAMERA_PROTOCOL_VERSION;
+    qrPayload[1] = CAMERA_MESSAGE_QR;
+    writeU16(&qrPayload[2], qrSequence);
     qrPayload[4] = static_cast<uint8_t>(length);
-    memcpy(&qrPayload[5], payload, length);
-    qrPayloadLength = static_cast<uint8_t>(5 + length);
+    qrPayload[5] = (observation.geometryValid ? QR_FLAG_GEOMETRY_VALID : 0) |
+                   (observation.fullResolution ? QR_FLAG_FULL_RESOLUTION : 0) |
+                   (observation.mirrored ? QR_FLAG_MIRRORED : 0) |
+                   (observation.zbarFallback ? QR_FLAG_ZBAR_FALLBACK : 0);
+    writeU16(&qrPayload[6], observation.centerXPermille);
+    writeU16(&qrPayload[8], observation.centerYPermille);
+    writeU16(&qrPayload[10], observation.sidePermille);
+    writeU16(&qrPayload[12], observation.areaPermille);
+    writeU16(&qrPayload[14], static_cast<uint16_t>(observation.rotationCdeg));
+    memcpy(&qrPayload[CAMERA_QR_HEADER_SIZE], observation.payload, length);
+    qrPayloadLength = static_cast<uint8_t>(CAMERA_QR_HEADER_SIZE + length);
     lastQrSendMs = 0;
     qrPending = true;
     return true;
@@ -273,7 +294,7 @@ uint8_t apiMinor() { return minorVersion; }
 
 void begin() {}
 void update() {}
-bool publishQr(const char*) { return false; }
+bool publishQr(const QrObservation&) { return false; }
 bool connected() { return false; }
 uint32_t requestCount() { return 0; }
 uint32_t responseCount() { return 0; }
@@ -287,4 +308,3 @@ uint8_t apiMinor() { return 0; }
 #endif
 
 }  // namespace FcLink
-

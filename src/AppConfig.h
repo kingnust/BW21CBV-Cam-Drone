@@ -2,7 +2,7 @@
 
 #include "BuildConfig.h"
 
-#define BW21CAM_VERSION "0.4.0-qr-localization"
+#define BW21CAM_VERSION "0.6.0-qr-human-face"
 
 // Direct access-point mode matches the old ESP32-CAM test workflow.
 #define BW21CAM_USE_ACCESS_POINT 1
@@ -21,13 +21,19 @@
 #define BW21CAM_STREAM_WIDTH 1280
 #define BW21CAM_STREAM_HEIGHT 720
 
-// The ISP corrects the wide-angle lens before QR and object processing.
+// The ISP applies its generic wide-angle correction before QR and object
+// processing. On-device QR adds moderate/strong software rectification retries.
 #define BW21CAM_ENABLE_LENS_DISTORTION_CORRECTION 1
 
 #define BW21CAM_QR_STALE_MS 5000
 #define BW21CAM_OBJECT_STALE_MS 1500
 #define BW21CAM_VISION_MAX_OBJECTS 8
-#define BW21CAM_VISION_DEFAULT_ENABLED 0
+#define BW21CAM_VISION_DEFAULT_ENABLED 1
+
+// Set this one value to 1 to restore per-detection color classification in
+// the web UI, JSON API, and serial diagnostics. It is off by default so QR,
+// person, and face processing receive the available analysis time.
+#define BW21CAM_ENABLE_COLOR_DETECTION 0
 
 // PlatformIO enables this only in the bw21-cam-wk2132 environment.
 #define BW21CAM_FC_BAUD 115200

@@ -1,6 +1,7 @@
 #include "FcLink.h"
 
 #include "AppConfig.h"
+#include "DroneProtoCameraProtocol.h"
 
 namespace FcLink {
 
@@ -9,18 +10,10 @@ namespace FcLink {
 namespace {
 
 constexpr uint8_t MSP_API_VERSION = 1;
-constexpr uint16_t MSP2_CAMERA_QR = 0x3001;
 constexpr uint32_t API_QUERY_INTERVAL_MS = 1000;
 constexpr uint32_t LINK_TIMEOUT_MS = 2500;
 constexpr uint32_t QR_RETRY_INTERVAL_MS = 500;
-constexpr size_t QR_MAX_PAYLOAD = 96;
-constexpr uint8_t CAMERA_PROTOCOL_VERSION = 2;
-constexpr uint8_t CAMERA_MESSAGE_QR = 1;
-constexpr uint8_t CAMERA_QR_HEADER_SIZE = 16;
-constexpr uint8_t QR_FLAG_GEOMETRY_VALID = 1 << 0;
-constexpr uint8_t QR_FLAG_FULL_RESOLUTION = 1 << 1;
-constexpr uint8_t QR_FLAG_MIRRORED = 1 << 2;
-constexpr uint8_t QR_FLAG_ZBAR_FALLBACK = 1 << 3;
+namespace Protocol = DroneProtoCameraProtocol;
 
 enum ParseState : uint8_t {
     SYNC_DOLLAR,
@@ -54,23 +47,13 @@ uint8_t majorVersion = 0;
 uint8_t minorVersion = 0;
 
 uint16_t qrSequence = 0;
-uint8_t qrPayload[CAMERA_QR_HEADER_SIZE + QR_MAX_PAYLOAD] = {};
+uint8_t qrPayload[Protocol::QrMaxPayloadSize] = {};
 uint8_t qrPayloadLength = 0;
 uint32_t lastQrSendMs = 0;
 uint32_t qrSends = 0;
 uint32_t qrAcks = 0;
 uint32_t qrRejects = 0;
 bool qrPending = false;
-
-uint8_t crc8DvbS2(uint8_t crc, uint8_t value)
-{
-    crc ^= value;
-    for (uint8_t bit = 0; bit < 8; bit++) {
-        crc = (crc & 0x80) ? static_cast<uint8_t>((crc << 1) ^ 0xD5)
-                           : static_cast<uint8_t>(crc << 1);
-    }
-    return crc;
-}
 
 void sendApiRequest()
 {
@@ -82,24 +65,13 @@ void sendApiRequest()
 
 void sendMspV2(uint16_t command, const uint8_t* payload, uint16_t length)
 {
-    const uint8_t header[] = {
-        '$', 'X', '<', 0,
-        static_cast<uint8_t>(command),
-        static_cast<uint8_t>(command >> 8),
-        static_cast<uint8_t>(length),
-        static_cast<uint8_t>(length >> 8)
-    };
-
-    uint8_t crc = 0;
-    for (size_t i = 3; i < sizeof(header); i++) {
-        crc = crc8DvbS2(crc, header[i]);
+    uint8_t frame[Protocol::QrMaxFrameSize] = {};
+    size_t frameLength = 0;
+    if (!Protocol::buildMspV2Frame(command, payload, length,
+                                   frame, sizeof(frame), frameLength)) {
+        return;
     }
-    Serial1.write(header, sizeof(header));
-    for (uint16_t i = 0; i < length; i++) {
-        crc = crc8DvbS2(crc, payload[i]);
-    }
-    Serial1.write(payload, length);
-    Serial1.write(crc);
+    Serial1.write(frame, frameLength);
     Serial1.flush();
 }
 
@@ -116,17 +88,16 @@ void acceptV1Frame(uint32_t now)
 
 void acceptV2Frame(uint32_t now)
 {
-    if (parseCommand != MSP2_CAMERA_QR || parseSize < 4 || !qrPending) {
+    if (parseCommand != Protocol::Msp2CameraQr || !qrPending) {
         return;
     }
 
-    const uint16_t sequence = parsePayload[2] |
-                              (static_cast<uint16_t>(parsePayload[3]) << 8);
-    if (parsePayload[0] != qrPayload[0] || sequence != qrSequence) {
+    uint8_t status = 0xff;
+    if (!Protocol::parseQrAck(parsePayload, parseSize, qrPayload[0], qrSequence, status)) {
         return;
     }
 
-    if (parsePayload[1] == 0 || parsePayload[1] == 1) {
+    if (status == 0 || status == 1) {
         qrAcks++;
     } else {
         qrRejects++;
@@ -181,7 +152,7 @@ void parseByte(uint8_t value, uint32_t now)
             break;
         case V2_HEADER:
             parseHeader[parseIndex++] = value;
-            parseChecksum = crc8DvbS2(parseChecksum, value);
+            parseChecksum = Protocol::crc8DvbS2(parseChecksum, value);
             if (parseIndex == sizeof(parseHeader)) {
                 parseCommand = parseHeader[1] |
                                (static_cast<uint16_t>(parseHeader[2]) << 8);
@@ -195,7 +166,7 @@ void parseByte(uint8_t value, uint32_t now)
             break;
         case V2_PAYLOAD:
             parsePayload[parseIndex++] = value;
-            parseChecksum = crc8DvbS2(parseChecksum, value);
+            parseChecksum = Protocol::crc8DvbS2(parseChecksum, value);
             if (parseIndex >= parseSize) {
                 parseState = V2_CHECKSUM;
             }
@@ -229,7 +200,7 @@ void update()
 
     if (qrPending && now - lastQrSendMs >= QR_RETRY_INTERVAL_MS) {
         lastQrSendMs = now;
-        sendMspV2(MSP2_CAMERA_QR, qrPayload, qrPayloadLength);
+        sendMspV2(Protocol::Msp2CameraQr, qrPayload, qrPayloadLength);
         qrSends++;
     }
 
@@ -238,39 +209,19 @@ void update()
     }
 }
 
-void writeU16(uint8_t* destination, uint16_t value)
-{
-    destination[0] = static_cast<uint8_t>(value);
-    destination[1] = static_cast<uint8_t>(value >> 8);
-}
-
 bool publishQr(const QrObservation& observation)
 {
     if (!observation.payload || !observation.payload[0] || qrPending) {
         return false;
     }
 
-    size_t length = strlen(observation.payload);
-    if (length > QR_MAX_PAYLOAD) {
-        length = QR_MAX_PAYLOAD;
-    }
-
     qrSequence++;
-    qrPayload[0] = CAMERA_PROTOCOL_VERSION;
-    qrPayload[1] = CAMERA_MESSAGE_QR;
-    writeU16(&qrPayload[2], qrSequence);
-    qrPayload[4] = static_cast<uint8_t>(length);
-    qrPayload[5] = (observation.geometryValid ? QR_FLAG_GEOMETRY_VALID : 0) |
-                   (observation.fullResolution ? QR_FLAG_FULL_RESOLUTION : 0) |
-                   (observation.mirrored ? QR_FLAG_MIRRORED : 0) |
-                   (observation.zbarFallback ? QR_FLAG_ZBAR_FALLBACK : 0);
-    writeU16(&qrPayload[6], observation.centerXPermille);
-    writeU16(&qrPayload[8], observation.centerYPermille);
-    writeU16(&qrPayload[10], observation.sidePermille);
-    writeU16(&qrPayload[12], observation.areaPermille);
-    writeU16(&qrPayload[14], static_cast<uint16_t>(observation.rotationCdeg));
-    memcpy(&qrPayload[CAMERA_QR_HEADER_SIZE], observation.payload, length);
-    qrPayloadLength = static_cast<uint8_t>(CAMERA_QR_HEADER_SIZE + length);
+    size_t payloadLength = 0;
+    if (!Protocol::buildQrPayload(observation, qrSequence, qrPayload,
+                                  sizeof(qrPayload), payloadLength)) {
+        return false;
+    }
+    qrPayloadLength = static_cast<uint8_t>(payloadLength);
     lastQrSendMs = 0;
     qrPending = true;
     return true;

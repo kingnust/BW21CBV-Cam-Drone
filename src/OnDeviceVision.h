@@ -26,6 +26,7 @@ struct QrGeometry {
     bool fullResolution;
     bool mirrored;
     bool zbarFallback;
+    bool fisheyeCorrected;
     uint16_t centerXPermille;
     uint16_t centerYPermille;
     uint16_t sidePermille;
@@ -60,6 +61,8 @@ struct Status {
     uint32_t quircDecodeErrors;
     uint32_t quircMirroredDecodes;
     uint32_t zbarFallbackScans;
+    uint32_t qrFisheyeScans;
+    uint32_t qrFisheyeDecodes;
     uint32_t qrSequence;
     uint32_t qrSeenAtMs;
     uint32_t qrPublishedAtMs;
@@ -72,10 +75,12 @@ struct Status {
     uint8_t qrDarkest;
     uint8_t qrMean;
     uint8_t qrBrightest;
+    uint8_t qrFisheyeProfile;
     char qrPayload[QR_PAYLOAD_CAPACITY];
     uint32_t objectSequence;
     uint32_t objectSeenAtMs;
     uint32_t yoloFrames;
+    uint32_t faceFrames;
     uint8_t objectCount;
     ObjectResult objects[BW21CAM_VISION_MAX_OBJECTS];
 };

@@ -55,7 +55,11 @@ NN_MODELS_URL = (
     f"Arduino_package/release/{NN_MODELS_ARCHIVE}"
 )
 NN_MODELS_SHA256 = "acb3c512fe8e84531409b6cd4954dee84a63f7cdb9529479699af881b8fbf067"
-NN_MODEL_KEYS = ["yolov4_tiny"]
+NN_MODEL_KEYS = ["yolov4_tiny", "scrfd320p"]
+NN_MODEL_FILES = {
+    "yolov4_tiny": "yolov4_tiny.nb",
+    "scrfd320p": "scrfd_500m_bnkps_576x320_u8.nb",
+}
 MIN_FIRMWARE_BYTES_WITH_MODEL = 4 * 1024 * 1024
 REALTEK_TOOL_LOCK_TIMEOUT_SECONDS = 15 * 60
 REALTEK_UPLOAD_COMPONENTS = (
@@ -308,8 +312,11 @@ def ensure_nn_models():
         / "ameba_pro2_nn_models"
         / NN_MODELS_VERSION
     )
-    required = destination / "common_nn_models" / "yolov4_tiny.nb"
-    if required.is_file():
+    required = [
+        destination / "common_nn_models" / filename
+        for filename in NN_MODEL_FILES.values()
+    ]
+    if all(model.is_file() for model in required):
         select_nn_models(destination)
         return
 
@@ -339,8 +346,10 @@ def ensure_nn_models():
             archive.extractall(staging)
 
         extracted_root = staging / "ameba_pro2_nn_models"
-        if not (extracted_root / "common_nn_models" / "yolov4_tiny.nb").is_file():
-            raise RuntimeError("Realtek NN archive did not contain YOLOv4-tiny")
+        extracted_models = extracted_root / "common_nn_models"
+        if not all((extracted_models / filename).is_file()
+                   for filename in NN_MODEL_FILES.values()):
+            raise RuntimeError("Realtek NN archive did not contain the person/face models")
         if destination.exists():
             shutil.rmtree(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -369,9 +378,13 @@ def verify_vision_image(flash_path, core_version):
         / "common_nn_models"
     )
     manifest_path = model_root / "amebapro2_fwfs_nn_models.json"
-    model_path = model_root / "yolov4_tiny.nb"
-    if not manifest_path.is_file() or not model_path.is_file():
-        raise RuntimeError("The compiled image has no verifiable Realtek YOLO model source")
+    model_paths = {
+        key: model_root / filename for key, filename in NN_MODEL_FILES.items()
+    }
+    if not manifest_path.is_file() or not all(
+        model.is_file() for model in model_paths.values()
+    ):
+        raise RuntimeError("The compiled image has no verifiable person/face model source")
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     selected = manifest.get("FWFS", {}).get("files")
@@ -380,21 +393,22 @@ def verify_vision_image(flash_path, core_version):
             f"The Realtek firmware manifest selected {selected!r}, expected {NN_MODEL_KEYS!r}"
         )
 
-    model_bytes = model_path.stat().st_size
+    model_sizes = {key: model.stat().st_size for key, model in model_paths.items()}
+    model_bytes = sum(model_sizes.values())
     image_bytes = flash_path.stat().st_size
     minimum_bytes = model_bytes + MIN_FIRMWARE_BYTES_WITH_MODEL
     if image_bytes < minimum_bytes:
         raise RuntimeError(
-            "Vision firmware is too small to contain YOLOv4-tiny: "
+            "Vision firmware is too small to contain the person/face models: "
             f"image={image_bytes}, model={model_bytes}, minimum={minimum_bytes}"
         )
     print(
-        "Verified packaged YOLOv4-tiny: "
-        f"model={model_bytes} bytes, flash={image_bytes} bytes"
+        "Verified packaged person/face models: "
+        f"models={model_sizes}, total={model_bytes} bytes, flash={image_bytes} bytes"
     )
     return {
-        "model": NN_MODEL_KEYS[0],
-        "model_bytes": model_bytes,
+        "models": model_sizes,
+        "model_bytes_total": model_bytes,
         "flash_bytes": image_bytes,
     }
 
@@ -634,7 +648,9 @@ def stage_sources():
     if ONDEVICE_VISION == "1":
         # Realtek's prebuild hook discovers NN models by scanning the .ino file.
         sketch_manifest += (
+            "// BW21_NN_MODELS=yolov4_tiny,scrfd320p\n"
             "#include \"NNObjectDetection.h\"\n"
+            "#include \"NNFaceDetection.h\"\n"
             "#include \"VideoStream.h\"\n"
             "static void __attribute__((used)) bw21ModelManifest()\n"
             "{\n"
@@ -643,6 +659,9 @@ def stage_sources():
             "    NNObjectDetection manifest;\n"
             "    manifest.modelSelect(OBJECT_DETECTION, DEFAULT_YOLOV4TINY, "
             "NA_MODEL, NA_MODEL);\n"
+            "    NNFaceDetection faceManifest;\n"
+            "    faceManifest.modelSelect(FACE_DETECTION, NA_MODEL, DEFAULT_SCRFD, "
+            "NA_MODEL);\n"
             "}\n"
         )
     (SKETCH_DIR / "BW21Cam.ino").write_text(sketch_manifest, encoding="ascii")

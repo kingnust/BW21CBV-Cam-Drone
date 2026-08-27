@@ -1,21 +1,11 @@
 #pragma once
 
 #include <Arduino.h>
+#include "DroneProtoCameraProtocol.h"
 
 namespace FcLink {
 
-struct QrObservation {
-    const char* payload;
-    bool geometryValid;
-    bool fullResolution;
-    bool mirrored;
-    bool zbarFallback;
-    uint16_t centerXPermille;
-    uint16_t centerYPermille;
-    uint16_t sidePermille;
-    uint16_t areaPermille;
-    int16_t rotationCdeg;
-};
+using QrObservation = DroneProtoCameraProtocol::QrObservation;
 
 void begin();
 void update();

@@ -63,8 +63,8 @@ is selected for the drone.
 ### On-device BW21 vision
 
 ```powershell
-platformio run -e bw21-cam-vision
-platformio run -e bw21-cam-vision -t upload
+platformio run
+platformio run -t upload
 ```
 
 The vision build starts in low-load `Camera` mode. The web-page `Camera` /
@@ -73,14 +73,23 @@ reboot; disabling vision pauses the NN pipeline and stops both analysis camera
 channels so the live stream receives the available processing time. When
 enabled, a dedicated 640 x 480 camera channel feeds a fast QVGA QR search on
 every analysis frame. Timed full-resolution retries preserve
-small-code range, and contrast/ZBar fallbacks run only after the clean quirc
-passes fail. This leaves the 1280 x 720 live stream cadence independent of QR
-latency. The same analysis channel calculates per-object color, while the
-Realtek NN engine runs YOLOv4-tiny on a separate 576 x 320, 10 FPS channel.
-Results, fast/full scan counters, and stage timings are available in the web
+small-code range. If a clean full-resolution pass fails, one QVGA software
+rectification pass compensates for the fisheye lens; moderate and strong
+profiles alternate so this fallback stays bounded. Detected rectified corners
+are mapped back into the original 640 x 480 coordinates before localization.
+Contrast/ZBar fallbacks remain available after that. This leaves the 1280 x 720
+live stream cadence independent of QR latency. A separate 576 x 320, 10 FPS
+channel feeds YOLOv4-tiny and SCRFD, but only `person` and `face` detections are
+published; all other COCO classes are ignored. Color classification remains in
+the firmware source but defaults off through
+`BW21CAM_ENABLE_COLOR_DETECTION` in `src/AppConfig.h`; change that one value to
+`1` to restore color processing and output. QR, person, and face vision starts
+automatically at boot and can still be paused from the web page. Results,
+fast/full/fisheye scan counters, and stage timings are available in the web
 page, `/api/status`, and `/api/vision`.
 
-Use `bw21-cam-vision-wk2132` to add the FC link. The camera sends each decoded
+The default `bw21-cam-vision-wk2132` environment includes the FC link. The
+camera sends each decoded
 QR payload plus normalized center, apparent size, image area, and orientation
 through the acknowledged MSP2 v2 transport. A still-visible code is refreshed
 at up to 4 Hz for localization filtering. Ordinary camera and WK2132 builds do
@@ -114,7 +123,7 @@ not connect to the WK2132 over I2C; it connects to the WK2132 camera UART:
 UART settings are 115200 baud, 8 data bits, no parity, and 1 stop bit. The
 signals are 3.3 V logic. Always cross TX to RX and join grounds.
 
-After camera-only testing succeeds, select the dedicated PlatformIO environment:
+For a WK2132 link without onboard vision, select the camera-only environment:
 
 ```powershell
 platformio run -e bw21-cam-wk2132
@@ -129,7 +138,8 @@ The included link layer then:
 - exposes the reliable MSP2 QR observation and acknowledgement path.
 
 The matching flight-controller environment is
-`drone_proto_esp32s3_wk2132_experimental`. It routes the WK2132 camera UART to
+`drone_proto_esp32s3_wk2132_experimental`, which is now the FC project's
+default. It routes the WK2132 camera UART to
 a dedicated MSP parser while the WK2132 itself remains on the shared FC I2C
 bus. Use the FC CLI commands `wk2132`, `camstatus`, and `qrloc` to inspect the
 bridge, QR observations, and experimental fused position. The full landmark

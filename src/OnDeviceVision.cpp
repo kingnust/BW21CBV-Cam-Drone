@@ -6,6 +6,7 @@
 
 #include <SPI.h>
 #include <JPEGDEC_Libraries/JPEGDEC.h>
+#include <NNFaceDetection.h>
 #include <NNObjectDetection.h>
 #include <QRCodeScanner.h>
 #include <StreamIO.h>
@@ -44,6 +45,29 @@ constexpr uint32_t QR_REAPPEAR_MS = 1800;
 constexpr uint32_t QR_OBSERVATION_INTERVAL_MS = 250;
 constexpr uint32_t OBJECT_HOLD_MS = 700;
 constexpr float OBJECT_BOX_NEW_WEIGHT = 0.45f;
+constexpr int32_t FISHEYE_FIXED_ONE = 4096;
+
+// The ISP LDC is generic rather than calibrated for this exact lens. Preserve
+// the unmodified scan path, then alternate these two conservative software
+// rectification strengths when a clean full-resolution scan does not decode.
+enum class FisheyeProfile : uint8_t {
+    NONE = 0,
+    MODERATE = 1,
+    STRONG = 2
+};
+
+struct FisheyeParameters {
+    int16_t centerScaleQ12;
+    int16_t radialQ12;
+};
+
+constexpr FisheyeParameters FISHEYE_PROFILES[] = {
+    {FISHEYE_FIXED_ONE, 0},
+    {FISHEYE_FIXED_ONE, 328},  // k=0.080; edge scale=0.92, corner=0.84
+    {FISHEYE_FIXED_ONE, 573}   // k=0.140; edge scale=0.86, corner=0.72
+};
+
+#if BW21CAM_ENABLE_COLOR_DETECTION
 constexpr uint8_t COLOR_COUNT = 12;
 
 enum ColorId : uint8_t {
@@ -70,14 +94,17 @@ struct ColorAccumulator {
     uint32_t count[COLOR_COUNT];
     uint32_t total;
 };
+#endif
 
 struct DecodeContext {
     uint8_t* luma;
     uint16_t width;
     uint16_t height;
+#if BW21CAM_ENABLE_COLOR_DETECTION
     ObjectResult objects[BW21CAM_VISION_MAX_OBJECTS];
     ColorAccumulator objectColors[BW21CAM_VISION_MAX_OBJECTS];
     uint8_t objectCount;
+#endif
     uint8_t darkest;
     uint8_t brightest;
     uint32_t histogram[256];
@@ -85,16 +112,25 @@ struct DecodeContext {
     uint64_t luminanceSum;
 };
 
+struct DetectionCache {
+    ObjectResult objects[BW21CAM_VISION_MAX_OBJECTS];
+    uint8_t count;
+    uint32_t seenAtMs;
+};
+
 VideoSetting qrConfig(QR_WIDTH, QR_HEIGHT, QR_FPS, VIDEO_JPEG, 1);
 VideoSetting nnConfig(NN_WIDTH, NN_HEIGHT, NN_FPS, VIDEO_RGB, 0);
 NNObjectDetection objectDetector;
-StreamIO nnStreamer(1, 1);
+NNFaceDetection faceDetector;
+StreamIO nnStreamer(1, 2);
 JPEGDEC jpegDecoder;
 SemaphoreHandle_t stateMutex = nullptr;
 SemaphoreHandle_t analysisMutex = nullptr;
 volatile bool visionActive = false;
 Status state = {};
 DecodeContext decodeContext = {};
+DetectionCache personCache = {};
+DetectionCache faceCache = {};
 uint8_t qrLuma[QR_PIXELS] = {};
 uint8_t qrFastLuma[QR_FAST_PIXELS] = {};
 zbar_image_scanner_t* qrScanner = nullptr;
@@ -106,6 +142,9 @@ struct quirc_data quircData = {};
 uint32_t lastFullScanAtMs = 0;
 uint32_t lastZbarScanAtMs = 0;
 uint32_t lastColorSampleAtMs = 0;
+uint8_t nextFisheyeProfile = static_cast<uint8_t>(FisheyeProfile::MODERATE);
+int16_t fisheyeNormalizedX[QR_FAST_WIDTH] = {};
+int16_t fisheyeNormalizedY[QR_FAST_HEIGHT] = {};
 
 constexpr char QR_SELF_TEST_PAYLOAD[] = "BW21-QR-EVERY-FRAME-2026";
 constexpr char QR_SELF_TEST_MODULES[] =
@@ -194,6 +233,7 @@ bool isValidUtf8Text(const char* text, size_t length)
     return length > 0;
 }
 
+#if BW21CAM_ENABLE_COLOR_DETECTION
 ColorId classifyColor(uint8_t red, uint8_t green, uint8_t blue)
 {
     const uint8_t maximum = std::max(red, std::max(green, blue));
@@ -201,7 +241,9 @@ ColorId classifyColor(uint8_t red, uint8_t green, uint8_t blue)
     const uint8_t delta = maximum - minimum;
     if (maximum < 45) return COLOR_BLACK;
 
-    const uint16_t saturation = maximum ? (static_cast<uint16_t>(delta) * 255U) / maximum : 0;
+    const uint16_t saturation = maximum
+                                    ? (static_cast<uint16_t>(delta) * 255U) / maximum
+                                    : 0;
     if (saturation < 36) {
         if (maximum > 210) return COLOR_WHITE;
         if (maximum < 82) return COLOR_BLACK;
@@ -210,11 +252,14 @@ ColorId classifyColor(uint8_t red, uint8_t green, uint8_t blue)
 
     int16_t hue;
     if (maximum == red) {
-        hue = static_cast<int16_t>(60 * (static_cast<int16_t>(green) - blue) / delta);
+        hue = static_cast<int16_t>(
+            60 * (static_cast<int16_t>(green) - blue) / delta);
     } else if (maximum == green) {
-        hue = static_cast<int16_t>(120 + 60 * (static_cast<int16_t>(blue) - red) / delta);
+        hue = static_cast<int16_t>(
+            120 + 60 * (static_cast<int16_t>(blue) - red) / delta);
     } else {
-        hue = static_cast<int16_t>(240 + 60 * (static_cast<int16_t>(red) - green) / delta);
+        hue = static_cast<int16_t>(
+            240 + 60 * (static_cast<int16_t>(red) - green) / delta);
     }
     if (hue < 0) hue += 360;
 
@@ -250,6 +295,7 @@ void finishColor(const ColorAccumulator& accumulator, char* name,
                      ? static_cast<uint8_t>((winnerCount * 100U) / accumulator.total)
                      : 0;
 }
+#endif
 
 int drawJpegBlock(JPEGDRAW* draw)
 {
@@ -276,6 +322,7 @@ int drawJpegBlock(JPEGDRAW* draw)
         return 1;
     }
 
+#if BW21CAM_ENABLE_COLOR_DETECTION
     for (int row = 0; row < draw->iHeight; row++) {
         const int y = draw->y + row;
         if (y < 0 || y >= decodeContext.height) continue;
@@ -284,9 +331,12 @@ int drawJpegBlock(JPEGDRAW* draw)
             if (x < 0 || x >= decodeContext.width) continue;
 
             const uint16_t pixel = draw->pPixels[row * draw->iWidth + column];
-            const uint8_t red = static_cast<uint8_t>(((pixel >> 11) & 0x1f) * 255U / 31U);
-            const uint8_t green = static_cast<uint8_t>(((pixel >> 5) & 0x3f) * 255U / 63U);
-            const uint8_t blue = static_cast<uint8_t>((pixel & 0x1f) * 255U / 31U);
+            const uint8_t red = static_cast<uint8_t>(
+                ((pixel >> 11) & 0x1f) * 255U / 31U);
+            const uint8_t green = static_cast<uint8_t>(
+                ((pixel >> 5) & 0x3f) * 255U / 63U);
+            const uint8_t blue = static_cast<uint8_t>(
+                (pixel & 0x1f) * 255U / 31U);
             const uint8_t luminance = static_cast<uint8_t>(
                 (77U * red + 150U * green + 29U * blue) >> 8);
             decodeContext.luma[static_cast<size_t>(y) * decodeContext.width + x] =
@@ -303,16 +353,23 @@ int drawJpegBlock(JPEGDRAW* draw)
                 const ObjectResult& object = decodeContext.objects[i];
                 const float marginX = (object.xMax - object.xMin) * 0.12f;
                 const float marginY = (object.yMax - object.yMin) * 0.12f;
-                const float normalizedX = static_cast<float>(x) / decodeContext.width;
-                const float normalizedY = static_cast<float>(y) / decodeContext.height;
-                if (normalizedX >= object.xMin + marginX && normalizedX <= object.xMax - marginX &&
-                    normalizedY >= object.yMin + marginY && normalizedY <= object.yMax - marginY) {
+                const float normalizedX = static_cast<float>(x) /
+                                          decodeContext.width;
+                const float normalizedY = static_cast<float>(y) /
+                                          decodeContext.height;
+                if (normalizedX >= object.xMin + marginX &&
+                    normalizedX <= object.xMax - marginX &&
+                    normalizedY >= object.yMin + marginY &&
+                    normalizedY <= object.yMax - marginY) {
                     addColor(decodeContext.objectColors[i], color);
                 }
             }
         }
     }
     return 1;
+#else
+    return 0;
+#endif
 }
 
 bool stretchContrast(uint8_t* luma, size_t pixels)
@@ -347,6 +404,104 @@ bool stretchContrast(uint8_t* luma, size_t pixels)
             (static_cast<uint16_t>(value - darkest) * 255U) / span);
     }
     return true;
+}
+
+void initializeFisheyeCoordinates()
+{
+    for (uint16_t x = 0; x < QR_FAST_WIDTH; x++) {
+        fisheyeNormalizedX[x] = static_cast<int16_t>(
+            (2L * x * FISHEYE_FIXED_ONE) / (QR_FAST_WIDTH - 1) -
+            FISHEYE_FIXED_ONE);
+    }
+    for (uint16_t y = 0; y < QR_FAST_HEIGHT; y++) {
+        fisheyeNormalizedY[y] = static_cast<int16_t>(
+            (2L * y * FISHEYE_FIXED_ONE) / (QR_FAST_HEIGHT - 1) -
+            FISHEYE_FIXED_ONE);
+    }
+}
+
+void mapRectifiedPointToSource(uint16_t destinationX, uint16_t destinationY,
+                               FisheyeProfile profile, uint32_t& sourceXQ8,
+                               uint32_t& sourceYQ8)
+{
+    destinationX = std::min<uint16_t>(destinationX, QR_FAST_WIDTH - 1);
+    destinationY = std::min<uint16_t>(destinationY, QR_FAST_HEIGHT - 1);
+    const FisheyeParameters parameters =
+        FISHEYE_PROFILES[static_cast<uint8_t>(profile)];
+    const int32_t normalizedX = fisheyeNormalizedX[destinationX];
+    const int32_t normalizedY = fisheyeNormalizedY[destinationY];
+    const int32_t radiusSquaredQ12 =
+        (normalizedX * normalizedX + normalizedY * normalizedY) /
+        FISHEYE_FIXED_ONE;
+    const int32_t scaleQ12 = std::max<int32_t>(
+        FISHEYE_FIXED_ONE / 2,
+        parameters.centerScaleQ12 -
+            (parameters.radialQ12 * radiusSquaredQ12) / FISHEYE_FIXED_ONE);
+    const int32_t sourceNormalizedX =
+        (normalizedX * scaleQ12) / FISHEYE_FIXED_ONE;
+    const int32_t sourceNormalizedY =
+        (normalizedY * scaleQ12) / FISHEYE_FIXED_ONE;
+    const int32_t mappedXQ8 =
+        ((sourceNormalizedX + FISHEYE_FIXED_ONE) * (QR_WIDTH - 1) * 256L) /
+        (2L * FISHEYE_FIXED_ONE);
+    const int32_t mappedYQ8 =
+        ((sourceNormalizedY + FISHEYE_FIXED_ONE) * (QR_HEIGHT - 1) * 256L) /
+        (2L * FISHEYE_FIXED_ONE);
+    sourceXQ8 = static_cast<uint32_t>(std::max<int32_t>(
+        0, std::min<int32_t>(mappedXQ8, (QR_WIDTH - 1) * 256L)));
+    sourceYQ8 = static_cast<uint32_t>(std::max<int32_t>(
+        0, std::min<int32_t>(mappedYQ8, (QR_HEIGHT - 1) * 256L)));
+}
+
+void rectifyFisheyeToFastLuma(FisheyeProfile profile)
+{
+    for (uint16_t y = 0; y < QR_FAST_HEIGHT; y++) {
+        for (uint16_t x = 0; x < QR_FAST_WIDTH; x++) {
+            uint32_t sourceXQ8 = 0;
+            uint32_t sourceYQ8 = 0;
+            mapRectifiedPointToSource(x, y, profile, sourceXQ8, sourceYQ8);
+            uint16_t sourceX = sourceXQ8 >> 8;
+            uint16_t sourceY = sourceYQ8 >> 8;
+            uint16_t fractionX = sourceXQ8 & 0xff;
+            uint16_t fractionY = sourceYQ8 & 0xff;
+            if (sourceX >= QR_WIDTH - 1) {
+                sourceX = QR_WIDTH - 2;
+                fractionX = 255;
+            }
+            if (sourceY >= QR_HEIGHT - 1) {
+                sourceY = QR_HEIGHT - 2;
+                fractionY = 255;
+            }
+
+            const size_t topOffset = static_cast<size_t>(sourceY) * QR_WIDTH + sourceX;
+            const size_t bottomOffset = topOffset + QR_WIDTH;
+            const uint32_t top =
+                qrLuma[topOffset] * (256U - fractionX) +
+                qrLuma[topOffset + 1] * fractionX;
+            const uint32_t bottom =
+                qrLuma[bottomOffset] * (256U - fractionX) +
+                qrLuma[bottomOffset + 1] * fractionX;
+            qrFastLuma[static_cast<size_t>(y) * QR_FAST_WIDTH + x] =
+                static_cast<uint8_t>(
+                    (top * (256U - fractionY) + bottom * fractionY + 32768U) >> 16);
+        }
+    }
+}
+
+void remapFisheyeCornersToSource(struct quirc_code& code, FisheyeProfile profile)
+{
+    for (uint8_t index = 0; index < 4; index++) {
+        const uint16_t rectifiedX = static_cast<uint16_t>(std::max(
+            0, std::min(code.corners[index].x, static_cast<int>(QR_FAST_WIDTH - 1))));
+        const uint16_t rectifiedY = static_cast<uint16_t>(std::max(
+            0, std::min(code.corners[index].y, static_cast<int>(QR_FAST_HEIGHT - 1))));
+        uint32_t sourceXQ8 = 0;
+        uint32_t sourceYQ8 = 0;
+        mapRectifiedPointToSource(rectifiedX, rectifiedY, profile,
+                                  sourceXQ8, sourceYQ8);
+        code.corners[index].x = (sourceXQ8 + 128U) >> 8;
+        code.corners[index].y = (sourceYQ8 + 128U) >> 8;
+    }
 }
 
 uint16_t toPermille(float value)
@@ -474,7 +629,8 @@ void transposeQrCode(struct quirc_code& code)
 }
 
 bool scanWithQuirc(struct quirc* decoder, const uint8_t* luma, size_t pixels,
-                   bool fullResolution, uint32_t now, int* candidates = nullptr)
+                   bool fullResolution, uint32_t now, int* candidates = nullptr,
+                   FisheyeProfile fisheyeProfile = FisheyeProfile::NONE)
 {
     uint8_t* image = quirc_begin(decoder, nullptr, nullptr);
     if (!image || !luma) return false;
@@ -488,6 +644,10 @@ bool scanWithQuirc(struct quirc* decoder, const uint8_t* luma, size_t pixels,
     state.quircScanPasses++;
     if (fullResolution) state.quircFullScans++;
     else state.quircFastScans++;
+    if (fisheyeProfile != FisheyeProfile::NONE) {
+        state.qrFisheyeScans++;
+        state.qrFisheyeProfile = static_cast<uint8_t>(fisheyeProfile);
+    }
     state.quircCandidates += count;
     state.qrCandidates += count;
     state.qrLastScanDetail = static_cast<int8_t>(std::min(count, 127));
@@ -507,12 +667,24 @@ bool scanWithQuirc(struct quirc* decoder, const uint8_t* luma, size_t pixels,
         xSemaphoreTake(stateMutex, portMAX_DELAY);
         if (error == QUIRC_SUCCESS) {
             if (mirrored) state.quircMirroredDecodes++;
-            const QrGeometry geometry = geometryFromQuirc(
-                quircCode, fullResolution ? QR_WIDTH : QR_FAST_WIDTH,
-                fullResolution ? QR_HEIGHT : QR_FAST_HEIGHT,
-                fullResolution, mirrored);
+            struct quirc_code geometryCode = quircCode;
+            if (fisheyeProfile != FisheyeProfile::NONE) {
+                remapFisheyeCornersToSource(geometryCode, fisheyeProfile);
+            }
+            QrGeometry geometry = geometryFromQuirc(
+                geometryCode,
+                (fullResolution || fisheyeProfile != FisheyeProfile::NONE)
+                    ? QR_WIDTH : QR_FAST_WIDTH,
+                (fullResolution || fisheyeProfile != FisheyeProfile::NONE)
+                    ? QR_HEIGHT : QR_FAST_HEIGHT,
+                fullResolution || fisheyeProfile != FisheyeProfile::NONE,
+                mirrored);
+            geometry.fisheyeCorrected = fisheyeProfile != FisheyeProfile::NONE;
             const bool accepted = acceptQrPayloadLocked(
                 quircData.payload, quircData.payload_len, now, geometry);
+            if (accepted && fisheyeProfile != FisheyeProfile::NONE) {
+                state.qrFisheyeDecodes++;
+            }
             if (!accepted) state.quircDecodeErrors++;
             xSemaphoreGive(stateMutex);
             if (accepted) return true;
@@ -649,8 +821,10 @@ void retainObjectHistory(ObjectResult* objects, uint8_t count)
         }
         if (best >= 0) {
             const ObjectResult& previous = state.objects[best];
+#if BW21CAM_ENABLE_COLOR_DETECTION
             copyText(objects[i].color, sizeof(objects[i].color), previous.color);
             objects[i].colorConfidence = previous.colorConfidence;
+#endif
             const float previousWeight = 1.0f - OBJECT_BOX_NEW_WEIGHT;
             objects[i].xMin = previous.xMin * previousWeight +
                               objects[i].xMin * OBJECT_BOX_NEW_WEIGHT;
@@ -664,6 +838,7 @@ void retainObjectHistory(ObjectResult* objects, uint8_t count)
     }
 }
 
+#if BW21CAM_ENABLE_COLOR_DETECTION
 void applyObjectColors()
 {
     for (uint8_t current = 0; current < state.objectCount; current++) {
@@ -682,10 +857,54 @@ void applyObjectColors()
             }
         }
         if (best >= 0) {
-            finishColor(decodeContext.objectColors[best], state.objects[current].color,
+            finishColor(decodeContext.objectColors[best],
+                        state.objects[current].color,
                         sizeof(state.objects[current].color),
                         state.objects[current].colorConfidence);
         }
+    }
+}
+#endif
+
+void updateDetectionCacheLocked(DetectionCache& cache,
+                                const ObjectResult* objects, uint8_t count,
+                                uint32_t now)
+{
+    if (count) {
+        memcpy(cache.objects, objects, sizeof(cache.objects));
+        cache.count = count;
+        cache.seenAtMs = now;
+    } else if (cache.count && now - cache.seenAtMs > OBJECT_HOLD_MS) {
+        cache = {};
+    }
+}
+
+void publishHumanDetectionsLocked(uint32_t now)
+{
+    ObjectResult combined[BW21CAM_VISION_MAX_OBJECTS] = {};
+    uint8_t count = 0;
+    uint32_t newestSeenAtMs = 0;
+    const DetectionCache* caches[] = {&faceCache, &personCache};
+    for (const DetectionCache* cache : caches) {
+        if (!cache->count || now - cache->seenAtMs > OBJECT_HOLD_MS) continue;
+        newestSeenAtMs = std::max(newestSeenAtMs, cache->seenAtMs);
+        for (uint8_t i = 0;
+             i < cache->count && count < BW21CAM_VISION_MAX_OBJECTS; i++) {
+            combined[count++] = cache->objects[i];
+        }
+    }
+
+    if (count) {
+        retainObjectHistory(combined, count);
+        memcpy(state.objects, combined, sizeof(combined));
+        state.objectCount = count;
+        state.objectSequence++;
+        state.objectSeenAtMs = newestSeenAtMs;
+    } else if (state.objectCount) {
+        state.objectSequence++;
+        memset(state.objects, 0, sizeof(state.objects));
+        state.objectCount = 0;
+        state.objectSeenAtMs = 0;
     }
 }
 
@@ -696,9 +915,9 @@ void objectResultCallback(std::vector<ObjectDetectionResult> results)
     ObjectResult objects[BW21CAM_VISION_MAX_OBJECTS] = {};
     uint8_t count = 0;
     for (size_t i = 0; i < results.size() && count < BW21CAM_VISION_MAX_OBJECTS; i++) {
-        if (results[i].score() < 35) continue;
+        if (results[i].type() != 0 || results[i].score() < 35) continue;
         ObjectResult& object = objects[count++];
-        copyText(object.name, sizeof(object.name), results[i].name());
+        copyText(object.name, sizeof(object.name), "person");
         copyText(object.color, sizeof(object.color), "unknown");
         object.score = static_cast<uint8_t>(std::min(results[i].score(), 100));
         object.xMin = clampUnit(results[i].xMin());
@@ -714,18 +933,38 @@ void objectResultCallback(std::vector<ObjectDetectionResult> results)
         return;
     }
     state.yoloFrames++;
-    if (count) {
-        retainObjectHistory(objects, count);
-        memcpy(state.objects, objects, sizeof(objects));
-        state.objectCount = count;
-        state.objectSequence++;
-        state.objectSeenAtMs = now;
-    } else if (!state.objectCount || now - state.objectSeenAtMs > OBJECT_HOLD_MS) {
-        if (state.objectCount) state.objectSequence++;
-        memset(state.objects, 0, sizeof(state.objects));
-        state.objectCount = 0;
-        state.objectSeenAtMs = 0;
+    updateDetectionCacheLocked(personCache, objects, count, now);
+    publishHumanDetectionsLocked(now);
+    xSemaphoreGive(stateMutex);
+}
+
+void faceResultCallback(std::vector<FaceDetectionResult> results)
+{
+    if (!visionActive) return;
+
+    ObjectResult objects[BW21CAM_VISION_MAX_OBJECTS] = {};
+    uint8_t count = 0;
+    for (size_t i = 0; i < results.size() && count < BW21CAM_VISION_MAX_OBJECTS; i++) {
+        if (results[i].score() < 35) continue;
+        ObjectResult& object = objects[count++];
+        copyText(object.name, sizeof(object.name), "face");
+        copyText(object.color, sizeof(object.color), "unknown");
+        object.score = static_cast<uint8_t>(std::min(results[i].score(), 100));
+        object.xMin = clampUnit(results[i].xMin());
+        object.yMin = clampUnit(results[i].yMin());
+        object.xMax = clampUnit(results[i].xMax());
+        object.yMax = clampUnit(results[i].yMax());
     }
+
+    const uint32_t now = millis();
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    if (!visionActive) {
+        xSemaphoreGive(stateMutex);
+        return;
+    }
+    state.faceFrames++;
+    updateDetectionCacheLocked(faceCache, objects, count, now);
+    publishHumanDetectionsLocked(now);
     xSemaphoreGive(stateMutex);
 }
 
@@ -744,18 +983,26 @@ bool decodeAnalysisJpeg(const uint8_t* jpeg, size_t length, bool fullResolution,
     decodeContext.height = height;
     decodeContext.darkest = 255;
 
+#if BW21CAM_ENABLE_COLOR_DETECTION
     if (sampleObjectColors) {
         xSemaphoreTake(stateMutex, portMAX_DELAY);
         decodeContext.objectCount = state.objectCount;
         memcpy(decodeContext.objects, state.objects, sizeof(state.objects));
         xSemaphoreGive(stateMutex);
     }
+#else
+    (void)sampleObjectColors;
+#endif
 
     bool decodeOk = jpegDecoder.openFLASH(const_cast<uint8_t*>(jpeg), length,
                                           drawJpegBlock) != 0;
     if (decodeOk) {
+#if BW21CAM_ENABLE_COLOR_DETECTION
         jpegDecoder.setPixelType(sampleObjectColors ? RGB565_LITTLE_ENDIAN
                                                     : EIGHT_BIT_GRAYSCALE);
+#else
+        jpegDecoder.setPixelType(EIGHT_BIT_GRAYSCALE);
+#endif
         decodeOk = jpegDecoder.getWidth() == QR_WIDTH &&
                    jpegDecoder.getHeight() == QR_HEIGHT &&
                    jpegDecoder.decode(0, 0,
@@ -801,14 +1048,20 @@ void processAnalysisJpeg(const uint8_t* jpeg, size_t length, uint32_t frameSeque
     }
 
     const uint32_t now = millis();
+#if BW21CAM_ENABLE_COLOR_DETECTION
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     const bool haveObjects = state.objectCount > 0;
     xSemaphoreGive(stateMutex);
+    const bool colorSampleDue = haveObjects &&
+                                now - lastColorSampleAtMs >= COLOR_SAMPLE_MS;
+#else
+    const bool colorSampleDue = false;
+#endif
     const bool fullScanDue = !accepted && now - lastFullScanAtMs >= QR_FULL_RETRY_MS;
-    const bool colorSampleDue = haveObjects && now - lastColorSampleAtMs >= COLOR_SAMPLE_MS;
     if (fullScanDue || colorSampleDue) {
         stageStarted = millis();
-        const bool fullDecodeOk = decodeAnalysisJpeg(jpeg, length, true, haveObjects);
+        const bool fullDecodeOk = decodeAnalysisJpeg(
+            jpeg, length, true, colorSampleDue);
         jpegDecodeMs += millis() - stageStarted;
         decodedAny = decodedAny || fullDecodeOk;
         if (fullDecodeOk) {
@@ -816,18 +1069,33 @@ void processAnalysisJpeg(const uint8_t* jpeg, size_t length, uint32_t frameSeque
             brightest = decodeContext.brightest;
             mean = static_cast<uint8_t>(decodeContext.luminanceSum /
                                         decodeContext.decodedPixels);
-            if (haveObjects) {
+#if BW21CAM_ENABLE_COLOR_DETECTION
+            if (colorSampleDue) {
                 xSemaphoreTake(stateMutex, portMAX_DELAY);
                 applyObjectColors();
                 xSemaphoreGive(stateMutex);
                 lastColorSampleAtMs = now;
             }
+#endif
             if (fullScanDue) {
                 lastFullScanAtMs = now;
                 int fullCandidates = 0;
                 stageStarted = millis();
                 accepted = scanWithQuirc(quircFullDecoder, qrLuma, QR_PIXELS,
                                          true, millis(), &fullCandidates);
+                if (!accepted) {
+                    const FisheyeProfile profile =
+                        static_cast<FisheyeProfile>(nextFisheyeProfile);
+                    nextFisheyeProfile =
+                        nextFisheyeProfile ==
+                                static_cast<uint8_t>(FisheyeProfile::MODERATE)
+                            ? static_cast<uint8_t>(FisheyeProfile::STRONG)
+                            : static_cast<uint8_t>(FisheyeProfile::MODERATE);
+                    rectifyFisheyeToFastLuma(profile);
+                    accepted = scanWithQuirc(
+                        quircFastDecoder, qrFastLuma, QR_FAST_PIXELS, false,
+                        millis(), nullptr, profile);
+                }
                 const bool zbarDue = now - lastZbarScanAtMs >= ZBAR_FALLBACK_MS;
                 if (!accepted && (fullCandidates > 0 || zbarDue) &&
                     stretchContrast(qrLuma, QR_PIXELS)) {
@@ -903,6 +1171,7 @@ bool begin()
     analysisMutex = xSemaphoreCreateMutex();
     if (!stateMutex || !analysisMutex) return false;
     state.enabled = false;
+    initializeFisheyeCoordinates();
 
     qrScanner = zbar_image_scanner_create(2, 2);
     qrImage = zbar_image_create();
@@ -954,10 +1223,16 @@ bool begin()
     objectDetector.modelSelect(OBJECT_DETECTION, DEFAULT_YOLOV4TINY, NA_MODEL, NA_MODEL);
     objectDetector.begin();
 
+    faceDetector.configVideo(nnConfig);
+    faceDetector.setResultCallback(faceResultCallback);
+    faceDetector.modelSelect(FACE_DETECTION, NA_MODEL, DEFAULT_SCRFD, NA_MODEL);
+    faceDetector.begin();
+
     nnStreamer.registerInput(Camera.getStream(NN_CHANNEL));
     nnStreamer.setStackSize();
     nnStreamer.setTaskPriority();
     nnStreamer.registerOutput(objectDetector);
+    nnStreamer.registerOutput(faceDetector);
     if (nnStreamer.begin() != 0) return false;
     nnStreamer.pause();
 
@@ -971,8 +1246,10 @@ bool begin()
         state.ready = false;
         return false;
     }
-    Serial.print("On-device vision ready: fast/full quirc + timed ZBar fallback + "
-                 "YOLOv4-tiny; mode=");
+    Serial.print("On-device vision ready: fisheye-aware QR + person-only YOLO + "
+                 "SCRFD face detection; color=");
+    Serial.print(BW21CAM_ENABLE_COLOR_DETECTION ? "enabled" : "disabled");
+    Serial.print("; mode=");
     Serial.println(state.enabled ? "vision" : "camera-only");
     return true;
 }
@@ -996,7 +1273,10 @@ bool setEnabled(bool enabled)
         lastFullScanAtMs = 0;
         lastZbarScanAtMs = 0;
         lastColorSampleAtMs = 0;
+        nextFisheyeProfile = static_cast<uint8_t>(FisheyeProfile::MODERATE);
         xSemaphoreTake(stateMutex, portMAX_DELAY);
+        personCache = {};
+        faceCache = {};
         state.enabled = true;
         xSemaphoreGive(stateMutex);
         nnStreamer.resume();
@@ -1015,6 +1295,8 @@ bool setEnabled(bool enabled)
         state.qrPayload[0] = 0;
         state.objectCount = 0;
         state.objectSeenAtMs = 0;
+        personCache = {};
+        faceCache = {};
         memset(state.objects, 0, sizeof(state.objects));
         xSemaphoreGive(stateMutex);
         xSemaphoreGive(analysisMutex);

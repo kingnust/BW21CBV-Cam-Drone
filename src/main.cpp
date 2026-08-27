@@ -208,9 +208,9 @@ const char INDEX_HTML[] = R"HTML(<!doctype html>
     stream.onload=()=>{lastProgressAt=Date.now();markLive('Live')};
     stream.onerror=()=>reconnect();
     function draw(v){const w=overlay.width=overlay.clientWidth*devicePixelRatio,h=overlay.height=overlay.clientHeight*devicePixelRatio;ctx.clearRect(0,0,w,h);if(!v.enabled)return;ctx.lineWidth=2*devicePixelRatio;ctx.font=(12*devicePixelRatio)+'px Arial';ctx.textBaseline='top';
-      v.objects.forEach(o=>{const x=(mirrored?1-o.box[2]:o.box[0])*w,y=o.box[1]*h,bw=(o.box[2]-o.box[0])*w,bh=(o.box[3]-o.box[1])*h,label=o.name+' '+o.score+'% '+o.color;ctx.strokeStyle='#50bd78';ctx.fillStyle='#50bd78';ctx.strokeRect(x,y,bw,bh);const tw=ctx.measureText(label).width+8*devicePixelRatio,lh=18*devicePixelRatio;ctx.fillRect(x,Math.max(0,y-lh),tw,lh);ctx.fillStyle='#07120b';ctx.fillText(label,x+4*devicePixelRatio,Math.max(0,y-lh)+2*devicePixelRatio)})}
-    function render(v){document.getElementById('fps').textContent=v.fps;document.getElementById('quality').textContent=v.quality;buttons.forEach((b,i)=>b.classList.toggle('active',i===v.profile));visionButtons.forEach((b,i)=>{b.classList.toggle('active',i===Number(v.enabled));b.disabled=visionSwitchBusy||!v.ready});document.getElementById('qr').textContent=v.enabled&&v.qr.fresh?v.qr.payload:'--';qrmeta.textContent=v.enabled&&v.qr.fresh&&v.qr.geometry.valid?'x '+v.qr.geometry.center_permille[0]+' y '+v.qr.geometry.center_permille[1]+' size '+v.qr.geometry.side_permille:'';objects.replaceChildren();
-      if(!v.enabled){const empty=document.createElement('span');empty.className='empty';empty.textContent=v.ready?'Vision off':'Vision unavailable';objects.appendChild(empty)}else if(v.objects.length){v.objects.forEach(o=>{const item=document.createElement('span');item.className='object';item.textContent=o.name+' '+o.score+'% | '+o.color+(o.color_confidence?' '+o.color_confidence+'%':'');objects.appendChild(item)})}else{const empty=document.createElement('span');empty.className='empty';empty.textContent='No objects';objects.appendChild(empty)}draw(v)}
+      v.objects.forEach(o=>{const x=(mirrored?1-o.box[2]:o.box[0])*w,y=o.box[1]*h,bw=(o.box[2]-o.box[0])*w,bh=(o.box[3]-o.box[1])*h,color=v.color_enabled&&o.color&&o.color!=='unknown'?' '+o.color:'',label=o.name+' '+o.score+'%'+color;ctx.strokeStyle=o.name==='face'?'#f1c75b':'#50bd78';ctx.fillStyle=ctx.strokeStyle;ctx.strokeRect(x,y,bw,bh);const tw=ctx.measureText(label).width+8*devicePixelRatio,lh=18*devicePixelRatio;ctx.fillRect(x,Math.max(0,y-lh),tw,lh);ctx.fillStyle='#07120b';ctx.fillText(label,x+4*devicePixelRatio,Math.max(0,y-lh)+2*devicePixelRatio)})}
+    function render(v){document.getElementById('fps').textContent=v.fps;document.getElementById('quality').textContent=v.quality;buttons.forEach((b,i)=>b.classList.toggle('active',i===v.profile));visionButtons.forEach((b,i)=>{b.classList.toggle('active',i===Number(v.enabled));b.disabled=visionSwitchBusy||!v.ready});document.getElementById('qr').textContent=v.enabled&&v.qr.fresh?v.qr.payload:'--';qrmeta.textContent=v.enabled&&v.qr.fresh&&v.qr.geometry.valid?'x '+v.qr.geometry.center_permille[0]+' y '+v.qr.geometry.center_permille[1]+' size '+v.qr.geometry.side_permille+(v.qr.geometry.fisheye_corrected?' fisheye':''):'';objects.replaceChildren();
+      if(!v.enabled){const empty=document.createElement('span');empty.className='empty';empty.textContent=v.ready?'Vision off':'Vision unavailable';objects.appendChild(empty)}else if(v.objects.length){v.objects.forEach(o=>{const item=document.createElement('span');item.className='object';item.textContent=o.name+' '+o.score+'%'+(v.color_enabled?' | '+o.color+(o.color_confidence?' '+o.color_confidence+'%':''):'');objects.appendChild(item)})}else{const empty=document.createElement('span');empty.className='empty';empty.textContent='No person or face';objects.appendChild(empty)}draw(v)}
     async function poll(){if(pollBusy)return;pollBusy=true;try{const r=await fetch('/api/vision',{cache:'no-store'});if(!r.ok)throw new Error('vision');const v=await r.json();render(v);const now=Date.now();
       if(lastFrames<0){lastFrames=v.stream_frames;lastProgressAt=now}else if(v.stream_frames!==lastFrames){lastFrames=v.stream_frames;lastProgressAt=now;markLive('Live')}else if(now-lastProgressAt>5000){reconnect(250)}
     }catch(e){if(!retryTimer)state.textContent='Control link lost'}finally{pollBusy=false}}
@@ -430,11 +430,12 @@ void sendVision(DriverClient& client)
                                          ? vision.analyzedFrames - qrAccountedFrames
                                          : 0;
 
-    static char json[2600];
+    static char json[2800];
     size_t used = appendText(
         json, sizeof(json), 0,
         "{\"profile\":%d,\"fps\":%u,\"quality\":%u,\"stream_frames\":%lu,"
-        "\"enabled\":%s,\"ready\":%s,\"frame_sequence\":%lu,\"frames\":%lu,"
+        "\"enabled\":%s,\"ready\":%s,\"color_enabled\":%s,"
+        "\"frame_sequence\":%lu,\"frames\":%lu,"
         "\"jpeg_errors\":%lu,\"process_ms\":%lu,\"max_process_ms\":%lu,"
         "\"jpeg_decode_ms\":%lu,\"qr_scan_ms\":%lu,"
         "\"qr_self_test\":%s,\"quirc_ready\":%s,\"quirc_self_test\":%s,"
@@ -444,11 +445,14 @@ void sendVision(DriverClient& client)
         "\"quirc_scans\":%lu,\"quirc_fast_scans\":%lu,\"quirc_full_scans\":%lu,"
         "\"quirc_candidates\":%lu,"
         "\"quirc_errors\":%lu,\"quirc_mirrored\":%lu,\"zbar_fallbacks\":%lu,"
-        "\"qr_enhanced_scans\":%lu,\"qr_bypassed_frames\":%lu,"
+        "\"qr_enhanced_scans\":%lu,\"fisheye_scans\":%lu,"
+        "\"fisheye_decodes\":%lu,\"fisheye_profile\":%u,"
+        "\"qr_bypassed_frames\":%lu,"
         "\"qr\":{\"fresh\":%s,\"age_ms\":%lu,\"sequence\":%lu,\"payload\":",
         activeProfile, PROFILES[activeProfile].fps, PROFILES[activeProfile].jpegQuality,
         static_cast<unsigned long>(frameCount),
         vision.enabled ? "true" : "false", vision.ready ? "true" : "false",
+        BW21CAM_ENABLE_COLOR_DETECTION ? "true" : "false",
         static_cast<unsigned long>(vision.frameSequence),
         static_cast<unsigned long>(vision.analyzedFrames),
         static_cast<unsigned long>(vision.jpegDecodeErrors),
@@ -474,6 +478,9 @@ void sendVision(DriverClient& client)
         static_cast<unsigned long>(vision.quircMirroredDecodes),
         static_cast<unsigned long>(vision.zbarFallbackScans),
         static_cast<unsigned long>(vision.qrEnhancedScans),
+        static_cast<unsigned long>(vision.qrFisheyeScans),
+        static_cast<unsigned long>(vision.qrFisheyeDecodes),
+        vision.qrFisheyeProfile,
         static_cast<unsigned long>(qrBypassedFrames),
         qrFresh ? "true" : "false",
         static_cast<unsigned long>(qrAge), static_cast<unsigned long>(vision.qrSequence));
@@ -481,16 +488,18 @@ void sendVision(DriverClient& client)
     used = appendText(
         json, sizeof(json), used,
         ",\"geometry\":{\"valid\":%s,\"full_resolution\":%s,"
-        "\"mirrored\":%s,\"zbar_fallback\":%s,\"center_permille\":[%u,%u],"
+        "\"mirrored\":%s,\"zbar_fallback\":%s,\"fisheye_corrected\":%s,"
+        "\"center_permille\":[%u,%u],"
         "\"side_permille\":%u,\"area_permille\":%u,\"rotation_cdeg\":%d},"
         "\"candidates\":%lu,\"no_finder\":%lu,\"decodes\":%lu,"
         "\"decode_errors\":%lu,\"duplicates\":%lu},"
         "\"objects_fresh\":%s,\"objects_age_ms\":%lu,"
-        "\"yolo_frames\":%lu,\"objects\":[",
+        "\"person_frames\":%lu,\"face_frames\":%lu,\"objects\":[",
         vision.qrGeometry.valid ? "true" : "false",
         vision.qrGeometry.fullResolution ? "true" : "false",
         vision.qrGeometry.mirrored ? "true" : "false",
         vision.qrGeometry.zbarFallback ? "true" : "false",
+        vision.qrGeometry.fisheyeCorrected ? "true" : "false",
         vision.qrGeometry.centerXPermille, vision.qrGeometry.centerYPermille,
         vision.qrGeometry.sidePermille, vision.qrGeometry.areaPermille,
         static_cast<int>(vision.qrGeometry.rotationCdeg),
@@ -499,18 +508,28 @@ void sendVision(DriverClient& client)
         static_cast<unsigned long>(vision.qrDecodes),
         static_cast<unsigned long>(vision.qrDecodeErrors),
         static_cast<unsigned long>(vision.qrDuplicates), objectsFresh ? "true" : "false",
-        static_cast<unsigned long>(objectAge), static_cast<unsigned long>(vision.yoloFrames));
+        static_cast<unsigned long>(objectAge), static_cast<unsigned long>(vision.yoloFrames),
+        static_cast<unsigned long>(vision.faceFrames));
     if (objectsFresh) {
         for (uint8_t i = 0; i < vision.objectCount; i++) {
             const OnDeviceVision::ObjectResult& object = vision.objects[i];
             used = appendText(json, sizeof(json), used, "%s{\"name\":", i ? "," : "");
             used = appendJsonString(json, sizeof(json), used, object.name);
-            used = appendText(json, sizeof(json), used, ",\"score\":%u,\"color\":", object.score);
+#if BW21CAM_ENABLE_COLOR_DETECTION
+            used = appendText(json, sizeof(json), used, ",\"score\":%u,\"color\":",
+                              object.score);
             used = appendJsonString(json, sizeof(json), used, object.color);
             used = appendText(
                 json, sizeof(json), used,
-                ",\"color_confidence\":%u,\"box\":[%.3f,%.3f,%.3f,%.3f]}",
-                object.colorConfidence, object.xMin, object.yMin, object.xMax, object.yMax);
+                ",\"color_confidence\":%u",
+                object.colorConfidence);
+#else
+            used = appendText(json, sizeof(json), used, ",\"score\":%u",
+                              object.score);
+#endif
+            used = appendText(json, sizeof(json), used,
+                              ",\"box\":[%.3f,%.3f,%.3f,%.3f]}",
+                              object.xMin, object.yMin, object.xMax, object.yMax);
         }
     }
     appendText(json, sizeof(json), used, "]}");
@@ -779,6 +798,7 @@ void startCamera()
     Camera.videoInit();
 #if BW21CAM_ENABLE_LENS_DISTORTION_CORRECTION
     cameraSettings.setLDC(1);
+    cameraSettings.getLDC();
 #endif
     Camera.channelBegin(CAMERA_CHANNEL);
     if (!OnDeviceVision::begin()) {
@@ -860,6 +880,12 @@ void printPeriodicStatus()
     Serial.print(vision.quircMirroredDecodes);
     Serial.print(" zbar_fb=");
     Serial.print(vision.zbarFallbackScans);
+    Serial.print(" fisheye=");
+    Serial.print(vision.qrFisheyeScans);
+    Serial.print('/');
+    Serial.print(vision.qrFisheyeDecodes);
+    Serial.print('/');
+    Serial.print(vision.qrFisheyeProfile);
     Serial.print(" qr_self_test=");
     Serial.print(vision.qrSelfTestPassed ? "PASS" : "FAIL");
     Serial.print(" quirc_self=");
@@ -880,6 +906,10 @@ void printPeriodicStatus()
     Serial.print(vision.qrBrightest);
     Serial.print(" objects=");
     Serial.print(vision.objectCount);
+    Serial.print(" person_frames=");
+    Serial.print(vision.yoloFrames);
+    Serial.print(" face_frames=");
+    Serial.print(vision.faceFrames);
 #endif
 #if BW21CAM_ENABLE_FC_LINK
     Serial.print(" fc=");
@@ -940,10 +970,12 @@ void printVisionEvents()
         Serial.print(object.name);
         Serial.print(" score=");
         Serial.print(object.score);
+#if BW21CAM_ENABLE_COLOR_DETECTION
         Serial.print(" color=");
         Serial.print(object.color);
         Serial.print(" color_conf=");
         Serial.print(object.colorConfidence);
+#endif
         Serial.print(" box=");
         Serial.print(object.xMin, 3);
         Serial.print(',');

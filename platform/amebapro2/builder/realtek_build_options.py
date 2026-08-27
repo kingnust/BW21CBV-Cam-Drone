@@ -4,6 +4,10 @@ import sys
 from pathlib import Path
 
 
+MULTI_MODEL_MARKER = "BW21_NN_MODELS=yolov4_tiny,scrfd320p"
+MULTI_MODEL_KEYS = ["yolov4_tiny", "scrfd320p"]
+
+
 def packages_root(path_text):
     path = Path(path_text)
     while path.parent != path:
@@ -11,6 +15,41 @@ def packages_root(path_text):
             return path
         path = path.parent
     raise RuntimeError(f"No packages directory in hardware path: {path_text}")
+
+
+def preserve_bw21_multi_model_manifest(options, roots, tools_path):
+    sketch_path = Path(options.get("sketchLocation", ""))
+    if not sketch_path.is_dir():
+        return
+    sketch_text = "\n".join(
+        source.read_text(encoding="utf-8", errors="ignore")
+        for source in sketch_path.glob("*.ino")
+    )
+    if MULTI_MODEL_MARKER not in sketch_text:
+        return
+
+    manifests = [tools_path / "amebapro2_fwfs_nn_models.json"]
+    for root in roots:
+        hardware_root = Path(root) / "realtek" / "hardware" / "AmebaPro2"
+        if not hardware_root.is_dir():
+            continue
+        manifests.extend(hardware_root.glob(
+            "*/variants/common_nn_models/amebapro2_fwfs_nn_models.json"
+        ))
+    manifests = [path for path in manifests if path.is_file()]
+    if not manifests:
+        raise RuntimeError("Could not locate the Realtek NN firmware manifest")
+
+    for manifest_path in manifests:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        missing = [key for key in MULTI_MODEL_KEYS if key not in manifest]
+        if missing:
+            raise RuntimeError(
+                "Realtek NN manifest is missing model key(s): " + ", ".join(missing)
+            )
+        manifest["FWFS"]["files"] = MULTI_MODEL_KEYS
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print("Preserved BW21 NN models: " + ", ".join(MULTI_MODEL_KEYS))
 
 
 def main():
@@ -45,6 +84,8 @@ def main():
     result = subprocess.run(
         [str(tool), str(build_path), str(tools_path), model_source], check=False
     )
+    if result.returncode == 0 and model_source.lower() in ("flash", "loadfromflash"):
+        preserve_bw21_multi_model_manifest(options, roots, tools_path)
     return result.returncode
 
 
